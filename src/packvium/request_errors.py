@@ -23,11 +23,12 @@ from typing import Any, Callable, Iterable, Mapping, Optional, Sequence, Set, Tu
 
 from ._canonical_json import MAX_EXACT_MAGNITUDE, json_integer, json_spelling
 from ._request_error import InvalidRequestError
-from .flat_bag import DEFORMABLE_BOUNDARY_KINDS, GUSSETED_BAG
+from .flat_bag import BAG_ORIENTATIONS, DEFORMABLE_BOUNDARY_KINDS, GUSSETED_BAG, STANDING
 from .units import LENGTH_UNIT_CODES, WEIGHT_UNIT_CODES, Length, ParsedMeasures, Weight
 from .made_to_measure import box_cost_minor_for
 from .orientations import CODES, UPRIGHT_CODES, SIGNED_CODE_NEEDS_A_HULL, refusal_reason, vocabulary
 from .bounds import MAX_BOUND_SUM
+from .hull import MAXIMUM_HULL_VERTICES
 
 REASONS = ("missing_field", "wrong_type", "below_minimum", "above_maximum", "negative_measure",
            "invalid_unit", "duplicate_id", "not_allowed", "invalid_value")
@@ -282,12 +283,20 @@ def _check_item(raw: Any, where: str, unit: str, measures: ParsedMeasures) -> No
     _optional(item, "allowed_rotations", where, lambda v, f: _allowed_rotations(v, f, item))
     _optional(item, "ground_contact_rule", where, lambda v, f: _one_of(v, f, GROUND_CONTACT_RULES))
     _optional(item, "shape_type", where, lambda v, f: _one_of(v, f, SHAPE_TYPES))
+    _optional(item, "hull_vertices", where, _hull_vertex_count)
     for name in ITEM_BOOLEANS:
         _optional(item, name, where, _boolean)
     listed = item.get("allowed_rotations")
     if listed is not None and not any(not item.get("keep_upright") or code in UPRIGHT_CODES for code in listed):
         raise InvalidRequestError("invalid_value", pointer_join(where, "allowed_rotations"),
                                   "must allow at least one rotation after keep_upright")
+
+
+def _hull_vertex_count(raw: Any, field: str) -> None:
+    """Only the count: the cap exists so no per-vertex work runs on an oversized hull. O(1)."""
+    if len(_list(raw, field)) > MAXIMUM_HULL_VERTICES:
+        raise InvalidRequestError("above_maximum", field,
+                                  f"must have at most {MAXIMUM_HULL_VERTICES} vertices")
 
 
 def _allowed_rotations(raw: Any, where: str, item: Mapping[str, Any]) -> None:
@@ -378,31 +387,59 @@ BAG_EXCLUSIONS = ("obstacles", "axles", "access_directions", "max_stack_density"
 
 def _deformable_boundary(container: Mapping[str, Any], raw: Any, field: str, where: str,
                          unit: str, measures: ParsedMeasures) -> None:
-    """The boundary object top to bottom -- kind, unknown keys, the gusset -- then the
-    container fields a bag refuses. O(1)."""
+    """The boundary object top to bottom -- kind, unknown keys, the gussets, the orientation --
+    then the container fields a bag refuses. O(1)."""
     boundary = _object(raw, field)
     kind = _required(boundary, "kind", field)
     _one_of(kind, pointer_join(field, "kind"), DEFORMABLE_BOUNDARY_KINDS)
     gusseted = kind == GUSSETED_BAG
-    _known_fields(boundary, field, ("kind", "side_gusset_depth") if gusseted else ("kind",))
+    _known_fields(boundary, field, GUSSETED_BAG_FIELDS if gusseted else ("kind",))
     if gusseted:
-        _side_gusset_depth(container, _required(boundary, "side_gusset_depth", field),
-                           pointer_join(field, "side_gusset_depth"), unit, measures)
+        _gusseted_bag(container, boundary, field, unit, measures)
     for name in BAG_EXCLUSIONS:
         if _set_beside_a_bag(name, container.get(name)):
             raise InvalidRequestError("not_allowed", pointer_join(where, name),
                                       "cannot be combined with deformable_boundary")
 
 
-def _side_gusset_depth(container: Mapping[str, Any], value: Any, field: str, unit: str,
-                       measures: ParsedMeasures) -> None:
-    """A length, positive once read in ticks, and no deeper than the bag's inner width."""
+#: The keys a gusseted bag's boundary may carry (1.10 side gusset; 1.11 bottom gusset and
+#: orientation).
+GUSSETED_BAG_FIELDS = ("bottom_gusset_depth", "kind", "orientation", "side_gusset_depth")
+
+
+def _gusseted_bag(container: Mapping[str, Any], boundary: Mapping[str, Any], field: str, unit: str,
+                  measures: ParsedMeasures) -> None:
+    """The side gusset, then the bottom one, each a positive length within its fold; with
+    neither, the side gusset is reported missing as in 1.10. Then the orientation, and a
+    standing bag's bottom gusset. O(1)."""
+    side, bottom = boundary.get("side_gusset_depth"), boundary.get("bottom_gusset_depth")
+    if side is None and bottom is None:
+        _required(boundary, "side_gusset_depth", field)
+    inner = _ticks(container["inner_dimensions"], unit, measures)
+    if side is not None:
+        _gusset_depth(side, pointer_join(field, "side_gusset_depth"), inner[1],
+                      "exceeds inner_dimensions width", unit, measures)
+    if bottom is not None:
+        _gusset_depth(bottom, pointer_join(field, "bottom_gusset_depth"), 2 * inner[0],
+                      "exceeds twice inner_dimensions length", unit, measures)
+    orientation = boundary.get("orientation")
+    if orientation is None:
+        return
+    _one_of(orientation, pointer_join(field, "orientation"), BAG_ORIENTATIONS)
+    if orientation == STANDING and bottom is None:
+        raise InvalidRequestError("missing_field", pointer_join(field, "bottom_gusset_depth"),
+                                  "is required when orientation is standing")
+
+
+def _gusset_depth(value: Any, field: str, deepest: int, too_deep: str, unit: str,
+                  measures: ParsedMeasures) -> None:
+    """A length, positive once read in ticks, and no deeper than its fold allows."""
     _measure(value, field, Length, unit, measures)
     depth = measures.read(Length, value, unit).ticks
     if depth == 0:
         raise InvalidRequestError("invalid_value", field, "must be positive")
-    if depth > _ticks(container["inner_dimensions"], unit, measures)[1]:
-        raise InvalidRequestError("invalid_value", field, "exceeds inner_dimensions width")
+    if depth > deepest:
+        raise InvalidRequestError("invalid_value", field, too_deep)
 
 
 #: Every key the request schema's `made_to_measure` declares; it sets `additionalProperties: false`.
@@ -557,6 +594,25 @@ def _rate_table(raw: Any, where: str, currency: Optional[str]) -> None:
     _optional(table, "minimum_charge_minor", where, lambda v, f: _integer(v, f, 0))
     _optional(table, "fuel_surcharge_permille", where, lambda v, f: _integer(v, f, 0))
     _optional(table, "currency", where, lambda v, f: rate_table_currency(v, f, currency))
+    top_bracket_landed(
+        [json_integer(price) for price in table.get("prices_minor") or ()],
+        json_integer(table.get("minimum_charge_minor") or 0),
+        json_integer(table.get("fuel_surcharge_permille") or 0), where)
+
+
+def top_bracket_landed(prices: Sequence[int], minimum_charge: int, surcharge_permille: int,
+                       where: str) -> None:
+    """M1: the dearest bracket's landed cost, fuel surcharge included, against
+    `MAX_EXACT_MAGNITUDE`. The same arithmetic as `RateTable.charge_minor_or_none`, so no
+    bracket the table can bill passes it. A table with no prices is left to the other rules.
+    Shared with `request_objects`. O(prices)."""
+    if not prices:
+        return
+    base = max(max(prices), minimum_charge)
+    if base + -(-base * surcharge_permille // 1000) > MAX_EXACT_MAGNITUDE:
+        raise InvalidRequestError(
+            "above_maximum", where,
+            f"must price its top bracket at most {MAX_EXACT_MAGNITUDE} minor units with the fuel surcharge")
 
 
 def currency_code(value: Any, field: str) -> None:

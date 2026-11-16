@@ -191,11 +191,12 @@ def _publish_tariff_versions(
             ("minimum_charge_minor", "fuel_surcharge_permille", "accessorials"),
         )
         zones = _mapping(fields["cost_per_dimensional_kg_minor"], path + ".cost_per_dimensional_kg_minor")
-        costs = {
-            _text(zone, path + ".cost_per_dimensional_kg_minor key"):
-                _integer(cost, "{0}.cost_per_dimensional_kg_minor[{1!r}]".format(path, zone))
-            for zone, cost in zones.items()
-        }
+        # Validated in code-point order of the zone key so the first error never depends on
+        # the order a language happens to iterate the mapping in.
+        for zone in sorted(zones, key=str):
+            _text(zone, path + ".cost_per_dimensional_kg_minor key")
+            _integer(zones[zone], "{0}.cost_per_dimensional_kg_minor[{1!r}]".format(path, zone))
+        costs = dict(zones)
         accessorials = _load_accessorials(_default(fields, "accessorials", ()), path + ".accessorials")
         _model(path, lambda: registry.publish(
             carrier_id, service_id,

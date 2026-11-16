@@ -15,7 +15,7 @@ import copy
 import hashlib
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
-from ._canonical_json import CanonicalJsonError, canonical_json, json_integer, json_spelling
+from ._canonical_json import CanonicalJsonError, MAX_EXACT_MAGNITUDE, canonical_json, json_integer, json_spelling
 from ._compat import dataclass
 from .artifacts import FORMAT as ARTIFACT_FORMAT
 from .artifacts import SUITE_VERSION
@@ -276,10 +276,20 @@ def _stock_box(request: Mapping[str, Any], machine: Mapping[str, Any], stock_id:
         "quantity": 1,
         "inner_dimensions": _tick_box(inner),
         "outer_dimensions": _tick_box(outer),
-        "cost_minor": _stock_integer(machine.get("cost_minor"), "cost_minor") + per_square_metre(price, area),
+        "cost_minor": _safe_cost(_stock_integer(machine.get("cost_minor"), "cost_minor") + per_square_metre(price, area)),
         "tare_weight": {"value": str(declared_tare + per_square_metre(tare_rate, area)), "unit": "ticks"},
     })
     return box
+
+
+def _safe_cost(cost: int) -> int:
+    """The exact cost, or a refusal in the wording of the admission rule (C-13): a cut box larger
+    than its machine's own declared size can pass 2^53 - 1, which JavaScript cannot hold exactly."""
+    if cost > MAX_EXACT_MAGNITUDE:
+        raise PlanRevisionError(
+            "invalid_revision",
+            f"a made-to-measure container's cost_per_square_metre_minor prices the largest box above {MAX_EXACT_MAGNITUDE}")
+    return cost
 
 
 def _stock_object(value: Any, name: str, optional: bool = False) -> Mapping[str, Any]:

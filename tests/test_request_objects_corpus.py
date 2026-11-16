@@ -50,6 +50,7 @@ _UNIT_KEY = ("the deserializer's parse cache is keyed by the unit, which an obje
 
 #: Cases with no object form: the value cannot be held, or the deserializer changes it.
 NOT_OBJECTS: dict[str, str] = {
+    "item-hull-vertices-not-list": "an Item's hull_vertices is a sequence of points; a number is not one",
     "obstacle-origin-false": "a Point cannot hold a boolean instead of its coordinates",
     "obstacle-origin-zero": "a Point cannot hold a number instead of its coordinates",
     "obstacle-origin-nonempty-list": "a Point cannot hold a list instead of its coordinates",
@@ -58,6 +59,8 @@ NOT_OBJECTS: dict[str, str] = {
     "obstacle-additional-origin-zero": "a Point cannot hold a number instead of its coordinates",
     "obstacle-additional-origin-nonempty-list": "a Point cannot hold a list instead of its coordinates",
     "obstacle-additional-origin-empty-string": "a Point cannot hold text instead of its coordinates",
+    "container-flat-bag-orientation": "`bag_orientation` defaults to flat, so a flat bag that names "
+                                      "it cannot be told apart from one that does not",
     "obstacle-additional-boxes-not-list": "an Obstacle holds its additional boxes as a tuple",
     "request-not-object": "a request that is not an object has no objects",
     "items-missing": "Packer.pack takes the items as an argument",
@@ -136,6 +139,7 @@ DIFFERENT_ON_PURPOSE: dict[str, str] = {
     "container-access-direction-unknown": "an unknown direction keeps InvalidDirectionError",
     "item-accepts-stacking-groups-entry-empty": "a set's index counts in code-point order",
     "an-item-id-before-its-quantity": _CONSTRUCTOR_FIRST,
+    "item-hull-33-vertices-before-a-bad-coordinate": _CONSTRUCTOR_FIRST,
     "item-ids-before-containers": _CONSTRUCTOR_FIRST,
     "container-ids-before-fixed-placements": _CONSTRUCTOR_FIRST,
     "currency-before-configuration": _CONSTRUCTOR_FIRST,
@@ -156,7 +160,7 @@ DIFFERENT_ON_PURPOSE: dict[str, str] = {
 }
 
 #: Pinned, so the skip set cannot grow without this line changing too.
-SKIPPED = 105
+SKIPPED = 108
 
 
 @dataclass(frozen=True)

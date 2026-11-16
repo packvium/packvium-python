@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Sequence
 
 if TYPE_CHECKING:
-    from .constraints import LoadUnit
+    from .loads import LoadUnit
     from .models import Axle
 
 

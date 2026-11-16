@@ -7,8 +7,9 @@ from enum import Enum
 from typing import Iterable, Mapping
 
 from .axle_load import axle_reactions
-from .constraints import load_units, reserved_volume
+from .loads import load_units
 from .models import PackedContainer, UnpackedItem, placement_id
+from .ratios import reserved_volume
 from .units import Length
 
 

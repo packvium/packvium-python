@@ -19,6 +19,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from ._compat import dataclass
+from .flat_bag import STANDING, standing_dimensions
 from .geometry import AxisAlignedBox, Dimensions, Point
 from .units import Length
 
@@ -55,8 +56,12 @@ class Deck:
 
 
 def solving_frame(container: "Container") -> "Container":
-    """The container every solver packs: itself without a limit, else the widened frame
-    carrying its deck. The frame states no limit, so a second call returns it unchanged."""
+    """The container every solver packs: a standing bag turned to its `W x H x L` frame
+, a pallet with a limit widened to the frame carrying its deck, else itself. A
+    frame is marked as one, so a second call returns it unchanged."""
+    if container.bag_orientation == STANDING and not container.upright_frame:
+        return replace(container, inner_dimensions=standing_dimensions(container.inner_dimensions),
+                       upright_frame=True)
     limit = container.pallet_overhang_limit
     if limit is None:
         return container

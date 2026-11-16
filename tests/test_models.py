@@ -7,6 +7,11 @@ guarantee to everything downstream.
 
 from __future__ import annotations
 
+import copy
+import dataclasses
+import pickle
+import threading
+
 import pytest
 
 from packvium import (AxisAlignedBox, Axle, Container, Dimensions, FixedPlacement, FixedPlacementError, Item,
@@ -284,6 +289,45 @@ def test_a_void_fill_reserve_ratio_outside_zero_to_one_is_refused(ratio):
 def test_a_tag_limit_below_one_is_refused():
     with pytest.raises(ValueError, match="tag_limits"):
         Container.create("box", Dimensions.mm(10, 10, 10), tag_limits={"fragile": 0})
+
+
+def test_mutating_the_callers_dicts_after_construction_changes_nothing():
+    """The frozen objects own their mappings: a later edit cannot slip past the `>= 1` check."""
+    limits = {"fragile": 2}
+    container_meta = {"route": {"stops": [1, 2]}}
+    item_meta = {"note": ["a"]}
+    container = Container.create("box", Dimensions.mm(10, 10, 10), tag_limits=limits, metadata=container_meta)
+    item = Item("cube", Dimensions.mm(1, 1, 1), metadata=item_meta)
+    limits["fragile"] = 0
+    limits["other"] = 5
+    container_meta["route"]["stops"].append(3)
+    item_meta["note"].append("b")
+    assert dict(container.tag_limits) == {"fragile": 2}
+    assert container.metadata == {"route": {"stops": [1, 2]}}
+    assert item.metadata == {"note": ["a"]}
+    with pytest.raises(TypeError):
+        container.tag_limits["fragile"] = 0  # type: ignore[index]
+
+
+def test_admitted_tag_limits_stay_read_only_through_pickle_copy_and_replace():
+    container = Container.create("box", Dimensions.mm(10, 10, 10), tag_limits={"fragile": 2})
+    for copied in (pickle.loads(pickle.dumps(container)), copy.deepcopy(container),
+                   dataclasses.replace(container, cost_minor=1)):
+        assert dict(copied.tag_limits) == {"fragile": 2}
+        with pytest.raises(TypeError):
+            copied.tag_limits["fragile"] = 0  # type: ignore[index]
+
+
+def test_metadata_is_detached_without_copying_or_pickling_the_callers_objects():
+    lock = threading.Lock()
+    item = Item("cube", Dimensions.mm(1, 1, 1), metadata={"guard": lock, "tags": ["a"]})
+    assert item.metadata["guard"] is lock
+
+
+def test_a_hull_given_as_a_number_is_a_type_refusal_on_the_object_path():
+    with pytest.raises(TypeError, match="hull_vertices must be a list") as refusal:
+        Item("a", Dimensions.mm(10, 10, 10), shape_type="convex_hull", hull_vertices=5)  # type: ignore[arg-type]
+    assert refusal.value.reason == "wrong_type"
 
 
 def test_a_container_max_items_below_one_is_refused():

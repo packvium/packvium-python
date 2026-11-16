@@ -412,3 +412,60 @@ def test_null_obstacle_additional_boxes_packs_as_an_empty_list():
     expected = pack_from_dict(defaulted)
     result["algorithm"]["duration_ms"] = expected["algorithm"]["duration_ms"]
     assert result == expected
+
+
+def hull_item(vertices: object) -> dict:
+    return {"id": "hull", "dimensions": {"length": "100", "width": "100", "height": "100"},
+            "shape_type": "convex_hull", "hull_vertices": vertices}
+
+
+def hull_points(count: int) -> list[dict]:
+    corners = [{"x": x, "y": y, "z": z} for x in (0, 100) for y in (0, 100) for z in (0, 100)]
+    along_edge = [{"x": step, "y": 0, "z": 0} for step in range(1, count)]
+    return (corners + along_edge)[:count]
+
+
+def test_a_hull_of_32_vertices_is_accepted():
+    data = request()
+    data["items"] = [hull_item(hull_points(32))]
+
+    assert isinstance(pack_from_dict(data), dict)
+
+
+def test_a_hull_of_33_vertices_is_refused_at_admission():
+    data = request()
+    data["items"] = [hull_item(hull_points(33))]
+    with pytest.raises(InvalidRequestError) as caught:
+        pack_from_dict(data)
+
+    error = caught.value
+    assert (error.reason, error.field, error.detail) == (
+        "above_maximum", "/items/0/hull_vertices", "must have at most 32 vertices")
+
+
+def test_the_hull_cap_wins_over_a_vertex_that_would_fail_per_vertex_checks():
+    vertices = hull_points(33)
+    vertices[0] = {"x": -1, "y": 0, "z": 0}
+    assert refusal(lambda d: d.update(items=[hull_item(vertices)])).reason == "above_maximum"
+
+
+def test_a_hull_vertex_list_that_is_not_a_list_reports_its_own_type_error():
+    error = refusal(lambda d: d.update(items=[hull_item(5)]))
+
+    assert (error.reason, error.field, error.detail) == (
+        "wrong_type", "/items/0/hull_vertices", "must be a list")
+
+
+def test_a_hull_of_33_vertices_is_refused_when_the_item_is_built_directly():
+    from packvium import Dimensions, Item
+    from packvium.geometry import ShapeType
+    from packvium.units import Length
+
+    side = Length.parse("100")
+    vertices = tuple((x, 0, 0) for x in range(33))
+    with pytest.raises(InvalidRequestError) as caught:
+        Item(id="hull", dimensions=Dimensions(side, side, side), shape_type=ShapeType.CONVEX_HULL,
+             hull_vertices=vertices)
+
+    assert (caught.value.reason, caught.value.detail) == (
+        "above_maximum", "hull_vertices must have at most 32 vertices")

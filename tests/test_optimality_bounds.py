@@ -14,6 +14,7 @@ internal counter and nothing ever asserted it fired, so "internal" quietly becam
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -25,6 +26,7 @@ sys.path.insert(0, str(ROOT / "packvium-python" / "src"))
 import packvium  # noqa: E402
 from packvium import bounds, solvers  # noqa: E402
 from packvium.extensions import DefaultSolutionScorer  # noqa: E402
+from packvium.models import RateTable  # noqa: E402
 
 #: Four differently-shaped items. Identical items reach `GridSolver`'s quantity-compression
 #: fast path, which answers before most solvers are consulted -- a request that would make
@@ -65,8 +67,8 @@ def _spy(monkeypatch):
     recorded: list = []
     events: list[str] = []
 
-    def spy_bound(instances, containers, objective):
-        computed = _FOR_REQUEST(instances, containers, objective)
+    def spy_bound(instances, containers, objective, config=None):
+        computed = _FOR_REQUEST(instances, containers, objective, config)
         recorded.append(computed)
         events.append("bound")
         return computed
@@ -140,13 +142,101 @@ def test_the_height_key_abstains_where_no_volume_argument_holds():
 
 
 @pytest.mark.parametrize("objective", ["shipping_cost", "lowest_landed_cost"])
-def test_an_objective_without_a_bound_gets_none(objective):
-    """Their second keys go through billed weight and caller-declared tariffs, for which no
-    bound is designed -- recording nothing is the honest answer."""
+def test_a_billed_objective_without_its_divisor_gets_none(objective):
+    """The billed key needs the configuration's divisor; without one there is no number to
+    bound, and the packer refuses such a request before it gets here."""
     request = packvium.PackingRequest(
         tuple(packvium.Item.create(f"i{n}", packvium.Dimensions.mm(10, 10, 10)) for n in range(2)),
         (packvium.Container.create("box", packvium.Dimensions.mm(30, 30, 30)),))
     assert bounds.for_request(request.instances, request.containers, objective) is None
+
+
+def _billed(objective: str, containers: list, items: list, **configuration) -> dict:
+    return packvium.pack_from_dict({
+        "items": items, "containers": containers,
+        "configuration": {"objective": objective, "dimensional_weight_divisor": 5000,
+                          "dimensional_weight_length_unit": "cm",
+                          "dimensional_weight_weight_unit": "kg",
+                          "solver_profile": "exact_small", **configuration}})
+
+
+def _brick(quantity: int, grams: int) -> dict:
+    return {"id": "brick", "quantity": quantity, "weight": f"{grams} g",
+            "dimensions": {"length": "100", "width": "100", "height": "100"}}
+
+
+def test_shipping_cost_bills_at_least_the_floor_and_at_least_tare_plus_payload():
+    """A 200 x 100 x 100 mm box at divisor 5000 cm/kg is 0.4 kg dimensional; two 1 kg bricks
+    and a 300 g tare bill 2.3 kg actual, so the bound is the actual weight, and attained."""
+    result = _billed("shipping_cost",
+                     [{"id": "box", "tare_weight": "300 g",
+                       "inner_dimensions": {"length": "200", "width": "100", "height": "100"}}],
+                     [_brick(2, 1000)])
+    ticks = packvium.Weight.TICKS_PER_G
+    assert result["optimality"]["lower_bound"][:2] == [0, 2300 * ticks]
+    assert result["status"] == "optimal"
+
+
+def test_shipping_cost_takes_the_dimensional_floor_when_the_box_is_bulky():
+    """A 400 mm cube is 12.8 kg dimensional at 5000 cm/kg, above one light brick and its tare."""
+    result = _billed("shipping_cost",
+                     [{"id": "bulky", "inner_dimensions": {"length": "400", "width": "400", "height": "400"}}],
+                     [_brick(1, 100)])
+    assert result["optimality"]["lower_bound"][1] == 12_800 * packvium.Weight.TICKS_PER_G
+
+
+def test_landed_cost_sees_that_two_bricks_cannot_share_a_bracket():
+    """Two 1000 g bricks cannot share a 1500 g bracket, so two containers pay it twice: the
+    item cover says 200, which the weight cover alone (134) and the count term (100) miss."""
+    result = _billed("lowest_landed_cost", [
+        {"id": "snug-dear", "inner_dimensions": {"length": "200", "width": "100", "height": "100"},
+         "rate_table": {"weight_brackets_g": [20000], "prices_minor": [5000]}},
+        {"id": "unit-cheap", "inner_dimensions": {"length": "100", "width": "100", "height": "100"},
+         "rate_table": {"weight_brackets_g": [1500], "prices_minor": [100]}}], [_brick(2, 1000)])
+    assert result["optimality"]["lower_bound"][:2] == [0, 200]
+    assert result["score"][1] == 200
+
+
+def test_landed_cost_reads_the_cheapest_bracket_a_floor_can_reach_not_the_floors_own():
+    """A promotional dip: the 2 kg bracket is dearer than the 5 kg one. A load that could be
+    billed in either is bounded by the cheaper, since prices need not rise with weight."""
+    bound = bounds._landed_charge_bound(
+        [1000 * packvium.Weight.TICKS_PER_G], [1], False,
+        [bounds.Billing(0, 0, ((2000 * packvium.Weight.TICKS_PER_G, 700),
+                               (5000 * packvium.Weight.TICKS_PER_G, 400)))],
+        [(10, None, None, None)], 0, 1)
+    assert bound == 400
+
+
+def test_landed_cost_applies_the_minimum_charge_and_the_surcharge_to_every_bracket():
+    """`max(price, minimum)` then the ceiling surcharge, the rate table's own order."""
+    container = packvium.Container.create(
+        "c", packvium.Dimensions.mm(100, 100, 100),
+        rate_table=RateTable((1000, 2000), (100, 900), minimum_charge_minor=300,
+                             fuel_surcharge_permille=85))
+    assert bounds._brackets(container) == ((1000 * packvium.Weight.TICKS_PER_G, 326),
+                                           (2000 * packvium.Weight.TICKS_PER_G, 977))
+
+
+def test_a_type_no_bracket_can_price_is_left_out_and_none_left_withholds_the_bound():
+    """A floor above every bracket cannot be priced, and a packing that opens it is refused
+    rather than returned, so with nothing else to open no statement is made."""
+    unpriceable = bounds.Billing(0, 10, ((5, 100),))
+    with pytest.raises(bounds.BoundWithheld):
+        bounds._landed_charge_bound([1], [1], False, [unpriceable], [(10, None, None, None)], 0, 1)
+
+
+def test_the_fractional_cover_takes_cost_per_unit_order_and_rounds_only_once():
+    """Greedy by cost per unit is exact for one covering constraint; inventory caps an offer."""
+    assert bounds._cover([(10, 3, None), (4, 1, None)], 7) == 24          # 7 x 10/3, rounded up
+    assert bounds._cover([(10, 3, 1), (4, 1, None)], 7) == 10 + 16        # one 3-unit, then 4 x 4
+    assert bounds._cover([(10, 3, 1)], 7) is None                          # cannot cover
+    assert bounds._cover([(0, 5, None)], 7) == 0
+
+
+def test_the_shipping_bound_is_withheld_without_enough_inventory_to_open():
+    with pytest.raises(bounds.BoundWithheld):
+        bounds._billed_weight_bound([1, 1], [bounds.Billing(0, 5)], [1], 0, 2)
 
 
 def test_a_custom_solution_scorer_gets_no_bound():
@@ -269,12 +359,13 @@ def test_a_statement_stops_at_the_first_missed_position():
     assert bounds.statement((0, 1, 99, 0, 0), bound) is None
 
 
-def test_an_uncovered_objective_states_nothing():
-    """§ 1.5: absence is "no statement", never "attained"."""
-    result = packvium.pack_from_dict({"containers": CONTAINERS, "items": ITEMS, "configuration": {
-        "objective": "shipping_cost", "dimensional_weight_divisor": 5000,
-        "dimensional_weight_length_unit": "cm", "dimensional_weight_weight_unit": "kg"}})
-    assert set(result["optimality"]) == {"code"}
+def test_a_withheld_bound_states_nothing():
+    """§ 1.5: absence is "no statement", never "attained". Every built-in objective is covered
+    since, so the withheld case is a made-to-measure container (D13)."""
+    # A copy of the conformance fixture, so the test also runs in the published package.
+    request = json.loads((Path(__file__).parent / "fixtures"
+                          / "feature-made-to-measure-dimensional-weight-on-outer.json").read_text())
+    assert set(packvium.pack_from_dict(request)["optimality"]) == {"code"}
 
 
 def test_the_statement_does_not_depend_on_the_deadline():
@@ -486,3 +577,70 @@ def test_the_portable_gap_ceiling_is_inclusive(least):
     statement = bounds.statement((0, 1, least + bounds.MAX_BOUND_VALUE, 0, 0), bound)
     assert statement['absolute_gap'] == bounds.MAX_BOUND_VALUE
     assert bounds.statement((0, 1, least + bounds.MAX_BOUND_VALUE + 1, 0, 0), bound) is None
+
+
+def _landed_request(containers: list, items: list) -> dict:
+    return {"items": items, "containers": containers, "configuration": {
+        "objective": "lowest_landed_cost", "dimensional_weight_divisor": 5000,
+        "dimensional_weight_length_unit": "cm", "dimensional_weight_weight_unit": "kg",
+        "solver_profile": "fast", "time_limit_ms": 20000}}
+
+
+def test_the_landed_bound_reads_payload_slot_and_shrinking_limits_alike_in_engine_and_validator():
+    """A type whose floor no bracket reaches offers nothing; a payload cap and a slot limit
+    bound what a bracket carries; a nesting item drops the volume count. The engine's stated
+    bound and the validator's recomputed one agree."""
+    from packvium.result_validation import objective_lower_bound
+    request = _landed_request([
+        {"id": "bulky", "inner_dimensions": {"length": "500", "width": "500", "height": "500"},
+         "rate_table": {"weight_brackets_g": [1000], "prices_minor": [10]}},
+        {"id": "capped", "max_payload": "1500 g", "max_items": 1,
+         "inner_dimensions": {"length": "200", "width": "200", "height": "200"},
+         "rate_table": {"weight_brackets_g": [3000, 9000], "prices_minor": [300, 200]}}],
+        [{"id": "cup", "quantity": 2, "weight": "1000 g", "nesting_height": "10",
+          "dimensions": {"length": "100", "width": "100", "height": "50"}}])
+    stated = packvium.pack_from_dict(request)["optimality"]["lower_bound"]
+    assert list(objective_lower_bound(request))[:len(stated)] == stated
+    assert stated[1] == 400
+
+
+def test_nothing_placeable_bounds_the_billed_keys_at_zero():
+    """A payload no instance fits places nothing, opens nothing and bills nothing."""
+    from packvium.result_validation import objective_lower_bound
+    request = _landed_request([
+        {"id": "tiny", "quantity": 1, "max_payload": "1 g",
+         "inner_dimensions": {"length": "200", "width": "200", "height": "200"},
+         "rate_table": {"weight_brackets_g": [3000], "prices_minor": [300]}}],
+        [{"id": "brick", "weight": "1000 g", "dimensions": {"length": "100", "width": "100", "height": "100"}}])
+    assert objective_lower_bound(request)[:2] == (1, 0)
+    shipping = {**request, "configuration": {**request["configuration"], "objective": "shipping_cost"}}
+    assert objective_lower_bound(shipping)[:2] == (1, 0)
+    assert bounds._billed_weight_bound([1], [bounds.Billing(0, 5)], [None], 1, 0) == 0
+    assert bounds._landed_charge_bound([1], [1], False, [], [], 1, 0) == 0
+
+
+def test_a_landed_request_nothing_can_price_states_no_bound_in_the_validator():
+    from packvium import result_validation
+    request = _landed_request([
+        {"id": "bulky", "inner_dimensions": {"length": "500", "width": "500", "height": "500"},
+         "rate_table": {"weight_brackets_g": [1000], "prices_minor": [10]}}],
+        [{"id": "brick", "weight": "100 g", "dimensions": {"length": "100", "width": "100", "height": "100"}}])
+    assert result_validation.objective_lower_bound(request) is None
+    unit = result_validation._length_unit(request)
+    items = result_validation._parse_items(request, unit)
+    containers = result_validation._parse_containers(request, unit)
+    assert result_validation._stated_bound(request, "feasible", items, containers)[1] == \
+        "no priceable inventory carries a packing that attains the count bound"
+    custom = {**request, "configuration": {"objective": "custom"}}
+    assert result_validation._stated_bound(custom, "feasible", items, containers)[1] == \
+        "objective 'custom' has no bound"
+
+
+def test_the_validator_billing_helpers_cover_their_edges():
+    from packvium import result_validation as rv
+    assert rv._fractional_cover([], 0) == 0
+    assert rv._fractional_cover([(10, 3, 1)], 7) is None
+    assert rv._least_of_inventory([(5, 1)], 2) is None
+    assert rv._billed_term("shipping_cost", {}, {}, (), (), False, (0, 1, 0, 0, 0)) is None
+    assert bounds._brackets(packvium.Container.create("bare", packvium.Dimensions.mm(10, 10, 10))) == ()
+    assert bounds._cover([(1, 1, None)], 0) == 0

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import json
 from pathlib import Path
 from typing import Any
 
@@ -188,15 +189,29 @@ def test_a_wrong_bound_value_is_an_optimality_bound_mismatch() -> None:
 
 
 def test_a_bound_where_none_is_stated_is_an_optimality_bound_mismatch() -> None:
-    request = {**GAP, "configuration": {
-        "objective": "shipping_cost", "dimensional_weight_divisor": 5000,
-        "dimensional_weight_length_unit": "cm", "dimensional_weight_weight_unit": "kg"}}
+    """Every built-in objective is covered since; a made-to-measure container (D13)
+    is where no bound is stated."""
+    # A copy of the conformance fixture, so the test also runs in the published package.
+    request = json.loads((Path(__file__).parent / "fixtures"
+                          / "feature-made-to-measure-dimensional-weight-on-outer.json").read_text())
     result = pack_from_dict(request)
     result["optimality"]["lower_bound"] = [0]
     assert [(issue.code, issue.detail) for issue in validate(request, result)] == [(
         "optimality_bound_mismatch",
-        "lower_bound is reported where no bound is stated: objective 'shipping_cost' has no bound",
+        "lower_bound is reported where no bound is stated: a container is made to measure",
     )]
+
+
+def test_a_billed_objective_states_the_bound_the_validator_recomputes() -> None:
+    """The validator's own billed term agrees with what the engine states, and a
+    bound moved by one is caught."""
+    request = {**GAP, "configuration": {
+        "objective": "shipping_cost", "dimensional_weight_divisor": 5000,
+        "dimensional_weight_length_unit": "cm", "dimensional_weight_weight_unit": "kg"}}
+    result = pack_from_dict(request)
+    assert validate(request, result) == []
+    result["optimality"]["lower_bound"][1] -= 1
+    assert [issue.code for issue in validate(request, result)] == ["optimality_bound_mismatch"]
 
 
 def test_a_wrong_absolute_gap_is_an_optimality_gap_mismatch() -> None:

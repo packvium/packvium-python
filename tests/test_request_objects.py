@@ -17,6 +17,7 @@ from packvium.flat_bag import FLAT_BAG
 from packvium.geometry import Point, Rotation
 from packvium.made_to_measure import MadeToMeasure, as_triple
 from packvium.models import FixedPlacement, RateTable
+from packvium.request_errors import check_request
 from packvium.units import Length
 
 TOO_LARGE = 2**60
@@ -199,3 +200,54 @@ def test_the_json_path_still_reports_what_its_rules_do_not_name_as_invalid_value
         rate_table={"weight_brackets_g": [5000, 1000], "prices_minor": [500, 900]}))
     assert (error.reason, error.field) == ("invalid_value", "")
     assert str(error) == "invalid_request: rate_table weight brackets must be strictly ascending"
+
+
+# ------------------------------------------- a rate table's top bracket (M1) on both paths
+
+CEILING = 2**53 - 1
+TOP_BRACKET_MESSAGE = (f"invalid_request: /containers/0/rate_table: must price its top "
+                       f"bracket at most {CEILING} minor units with the fuel surcharge")
+OVER_THE_CEILING = [
+    ("price", {"prices_minor": [CEILING], "minimum_charge_minor": 0, "fuel_surcharge_permille": 1}),
+    ("minimum charge", {"prices_minor": [1], "minimum_charge_minor": CEILING, "fuel_surcharge_permille": 1}),
+    ("fuel surcharge", {"prices_minor": [10**15], "minimum_charge_minor": 0, "fuel_surcharge_permille": 10000}),
+]
+
+
+def table(fields: Json) -> RateTable:
+    return RateTable((1000,) * len(fields["prices_minor"]), tuple(fields["prices_minor"]),
+                     fields["minimum_charge_minor"], fields["fuel_surcharge_permille"])
+
+
+@pytest.mark.parametrize("name, fields", OVER_THE_CEILING, ids=[case[0] for case in OVER_THE_CEILING])
+def test_a_top_bracket_landing_above_the_ceiling_is_refused_on_both_paths(name: str, fields: Json) -> None:
+    from_objects = object_refusal(packed(containers=[box(rate_table=table(fields))]))
+    from_json = json_refusal(lambda r: r["containers"][0].update(
+        rate_table={"weight_brackets_g": [1000], **fields}))
+    for refusal in (from_objects, from_json):
+        assert (refusal.code, refusal.reason, refusal.field) == ("invalid_request", "above_maximum",
+                                                                 "/containers/0/rate_table")
+        assert str(refusal) == TOP_BRACKET_MESSAGE
+        assert refusal.args == from_json.args
+
+
+@pytest.mark.parametrize("fields", [
+    {"prices_minor": [CEILING], "minimum_charge_minor": 0, "fuel_surcharge_permille": 0},
+    {"prices_minor": [1], "minimum_charge_minor": CEILING, "fuel_surcharge_permille": 0},
+    {"prices_minor": [CEILING - 1000], "minimum_charge_minor": 0, "fuel_surcharge_permille": 0},
+])
+def test_a_top_bracket_landing_at_the_ceiling_is_admitted_on_both_paths(fields: Json) -> None:
+    check_request(json_request(lambda r: r["containers"][0].update(
+        rate_table={"weight_brackets_g": [1000], **fields})))
+    packed(containers=[box(rate_table=table(fields))])()
+
+
+def test_a_dearest_bracket_that_is_not_the_last_is_the_one_held_to_the_ceiling() -> None:
+    fields = {"weight_brackets_g": [500, 1000], "prices_minor": [CEILING, 1], "fuel_surcharge_permille": 1}
+    assert json_refusal(lambda r: r["containers"][0].update(rate_table=fields)).field == "/containers/0/rate_table"
+
+
+def test_a_mistyped_price_still_reports_its_own_error_before_the_top_bracket() -> None:
+    refusal = json_refusal(lambda r: r["containers"][0].update(rate_table={
+        "weight_brackets_g": [1000], "prices_minor": [CEILING, "x"], "fuel_surcharge_permille": 1000}))
+    assert (refusal.reason, refusal.field) == ("wrong_type", "/containers/0/rate_table/prices_minor/1")

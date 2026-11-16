@@ -44,7 +44,8 @@ class Packer:
         """
         if self.solution_scorer is not None:
             return None
-        return bounds.for_request(request.instances, request.containers, self.config.objective)
+        return bounds.for_request(request.instances, request.containers, self.config.objective,
+                                  self.config)
 
     def pack(self, items, containers, fixed_placements=(), currency: str | None = None) -> PackingResult:
         items, containers, fixed_placements = tuple(items), tuple(containers), tuple(fixed_placements)

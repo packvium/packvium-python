@@ -11,7 +11,7 @@ from packvium.config import SolverProfile
 from packvium.constraints import StopAccessibilityConstraint
 from packvium.extensions import LandedCostSolutionScorer, ShippingCostSolutionScorer
 from packvium.fixed_placements import FixedPlacementError
-from packvium.flat_bag import (as_dimensions, extent_of, fits_alone, girth_admits,
+from packvium.flat_bag import (as_dimensions, extent_of, fits_alone, girth_for,
                                grown_extent)
 from packvium.geometry import Dimensions, Point, Rotation
 from packvium.models import (Container, Item, ItemInstance, PackedContainer, PackingRequest,
@@ -26,6 +26,15 @@ from packvium.validation import IndependentSolutionValidator
 
 BAG = {"deformable_boundary": {"kind": "flat_bag"}}
 
+
+
+def _girth(inner, gusset=0, bottom=0):
+    """The flat frame's loops for a bag declared `inner`, through the engine's own builder."""
+    return girth_for(inner.length.ticks, inner.width.ticks, gusset, bottom, False)
+
+
+def _admits(inner, a, b, c, gusset=0):
+    return _girth(inner, gusset).admits((a, b, c))
 
 def ticks(millimetres: int) -> int:
     return Length.of(millimetres, "mm").ticks
@@ -74,11 +83,11 @@ def extent_mm(container: dict) -> tuple[int, ...]:
 class TestTheRule:
     def test_the_worked_examples_of_the_oracle(self):
         inner = mm(240, 140, 100)
-        assert girth_admits(inner, ticks(200), ticks(100), ticks(40))
-        assert not girth_admits(inner, ticks(200), ticks(100), ticks(40) + 1)
-        assert not girth_admits(inner, ticks(200) + ticks(40) + 1, 0, 0)
+        assert _admits(inner, ticks(200), ticks(100), ticks(40))
+        assert not _admits(inner, ticks(200), ticks(100), ticks(40) + 1)
+        assert not _admits(inner, ticks(200) + ticks(40) + 1, 0, 0)
         # A rod as long as the bag is flat passes the frame and fails the length girth.
-        assert not girth_admits(mm(1000, 480, 300), ticks(1000), ticks(10), ticks(10))
+        assert not _admits(mm(1000, 480, 300), ticks(1000), ticks(10), ticks(10))
 
     def test_the_running_extent_equals_the_extent_from_scratch(self):
         generator = random.Random(2602)
@@ -89,16 +98,16 @@ class TestTheRule:
             verdicts = []
             for box in boxes:
                 running = grown_extent(running, *box)
-                verdicts.append(girth_admits(mm(5000, 5000, 5000), *running))
+                verdicts.append(_admits(mm(5000, 5000, 5000), *running))
             assert running == extent_of(boxes)
             # Extents only grow, so a refused prefix is never admitted again.
             assert verdicts == sorted(verdicts, reverse=True)
 
     def test_a_single_box_fits_only_when_both_girths_hold(self):
         inner = mm(300, 300, 100)
-        assert not fits_alone(inner, mm(250, 150, 80))
-        assert fits_alone(inner, mm(220, 150, 80))
-        assert not fits_alone(inner, mm(310, 10, 10))
+        assert not fits_alone(inner, mm(250, 150, 80), _girth(inner))
+        assert fits_alone(inner, mm(220, 150, 80), _girth(inner))
+        assert not fits_alone(inner, mm(310, 10, 10), _girth(inner))
         assert as_dimensions((1, 2, 3)) == Dimensions(Length(1), Length(2), Length(3))
 
 

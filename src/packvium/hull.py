@@ -59,6 +59,10 @@ Axis = Tuple[int, int, int]
 #: Smallest number of vertices that can enclose a volume.
 MINIMUM_HULL_VERTICES = 4
 
+#: Most vertices an item's hull may list (the corpus maximum is 16). Refused at admission, before
+#: any per-vertex work, so a request cannot make the hull checks cost what it chooses.
+MAXIMUM_HULL_VERTICES = 32
+
 #: Largest absolute vertex coordinate a hull may carry, in ticks (6.25 m).
 #:
 #: Shared verbatim with PHP, Rust and JavaScript. Besides keeping admission identical across

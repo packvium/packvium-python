@@ -26,7 +26,7 @@ from .models import Container, FixedPlacement, Item, RateTable
 from .request_errors import (BAG_EXCLUSIONS, InvalidRequestError, _integer, _one_of,
                              _ratio, _set_beside_a_bag, _stacking_group_name, box_ticks,
                              currency_code, length_ticks, pallet_frame, pointer, pointer_join,
-                             rate_table_currency, total_weight_ticks, weight_ticks)
+                             rate_table_currency, top_bracket_landed, total_weight_ticks, weight_ticks)
 
 #: (JSON name, PackingConfig attribute, floor), in `check_request`'s order.
 _CONFIGURATION_INTEGERS = (("time_limit_ms", "time_limit_ms", 1), ("alternatives", "top_k", 1),
@@ -149,6 +149,7 @@ def _check_rate_table(table: RateTable, where: str, currency: Optional[str]) -> 
     _integer(table.fuel_surcharge_permille, pointer_join(where, "fuel_surcharge_permille"), 0)
     if table.currency is not None:
         rate_table_currency(table.currency, pointer_join(where, "currency"), currency)
+    top_bracket_landed(table.prices_minor, table.minimum_charge_minor, table.fuel_surcharge_permille, where)
 
 
 def _check_flat_bag(container: Container, where: str) -> None:

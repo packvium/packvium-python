@@ -56,14 +56,23 @@ def test_snapshot_lookup_indexes_do_not_change_value_copy_or_serialization():
     restored = CatalogSnapshot.__new__(CatalogSnapshot)
     restored.__setstate__({field.name: getattr(snapshot, field.name) for field in fields(snapshot)})
     assert restored.item('widget') == snapshot.items[0]
+    # A snapshot pickled before the fields were normalised to tuples holds lists; restoring it
+    # gives the tuples a new snapshot has, so the restored history cannot be edited either.
+    older = CatalogSnapshot.__new__(CatalogSnapshot)
+    older.__setstate__({field.name: list(getattr(snapshot, field.name)) for field in fields(snapshot)})
+    assert older.item('widget') == snapshot.items[0]
+    assert older.carton('box-s') == snapshot.cartons[0]
+    assert all(type(getattr(older, field.name)) is tuple for field in fields(older))
 
 
-def test_snapshot_lookup_preserves_mutable_and_custom_input_behavior():
+def test_snapshot_lookup_preserves_custom_input_behavior_and_detaches_the_callers_list():
     entries = [make_item('first')]
     snapshot = CatalogSnapshot(items=entries)
     assert snapshot.item('first') is entries[0]
     entries.append(make_item('second'))
-    assert snapshot.item('second') is entries[1]
+    assert snapshot.items == (entries[0],)
+    with pytest.raises(CatalogEntryNotFoundError):
+        snapshot.item('second')
     class MutableEntry:
         id = 'old'
     entry = MutableEntry()
@@ -97,3 +106,30 @@ def test_pinned_and_effective_history_keep_numeric_and_date_boundaries():
     assert registry.effective_tariff('acme-freight', 'ground', as_of=0).version == 63
     with pytest.raises(TariffNotFoundError):
         registry.effective_tariff('acme-freight', 'ground', as_of=-1)
+
+
+def test_published_history_cannot_be_edited_through_the_callers_or_the_returned_objects():
+    import copy
+    import pickle
+    from packvium.commerce.rating import AccessorialCharge
+    dimensions = [80, 60, 40]
+    master = ItemMaster("widget", dimensions, 250)
+    dimensions[0] = 1
+    assert master.dimensions_mm == (80, 60, 40)
+
+    rates = {"zone-1": 500}
+    surcharges = {"liftgate": AccessorialCharge("liftgate", flat_charge_minor=900)}
+    registry = CarrierRegistry()
+    registry.publish("acme-freight", "ground", effective_at=0, dimensional_weight_divisor=5000,
+                     cost_per_dimensional_kg_minor=rates, accessorials=surcharges)
+    rates["zone-1"] = 1
+    pinned = registry.tariff("acme-freight", "ground", 1)
+    assert pinned.cost_per_dimensional_kg_minor == {"zone-1": 500}
+    with pytest.raises(TypeError):
+        pinned.cost_per_dimensional_kg_minor["zone-1"] = 1
+    with pytest.raises(TypeError):
+        pinned.accessorials["extra"] = surcharges["liftgate"]
+    for restored in (copy.deepcopy(pinned), pickle.loads(pickle.dumps(pinned))):
+        assert restored == pinned
+        with pytest.raises(TypeError):
+            restored.cost_per_dimensional_kg_minor["zone-1"] = 1

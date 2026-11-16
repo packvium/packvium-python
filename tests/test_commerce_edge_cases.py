@@ -167,6 +167,11 @@ class TestTariffAdmission:
         with pytest.raises(CommerceInputError, match=message):
             load_document(tariff_document(**overrides))
 
+    @pytest.mark.parametrize("zones", [{"b": 1.5, "2": 1.5}, {"2": 1.5, "b": 1.5}])
+    def test_zones_are_validated_in_code_point_order_whatever_the_insertion_order(self, zones):
+        with pytest.raises(CommerceInputError, match=r"cost_per_dimensional_kg_minor\['2'\]"):
+            load_document(tariff_document(cost_per_dimensional_kg_minor=zones))
+
     def test_a_zone_map_must_be_an_object(self):
         with pytest.raises(CommerceInputError, match="expected an object"):
             load_document(tariff_document(cost_per_dimensional_kg_minor=[["zone-a", 450]]))
@@ -498,15 +503,15 @@ class TestLegalButSurprising:
 
         assert quote(document, dict(SHIPMENT, zone="zóna/1"))["status"] == "ok"
 
-    def test_a_quote_far_beyond_a_64_bit_product_stays_exact(self):
+    def test_a_quote_just_inside_the_ceiling_stays_exact(self):
         document = tariff_document(
             dimensional_weight_divisor=1,
-            cost_per_dimensional_kg_minor={"zone-a": 10 ** 12},
+            cost_per_dimensional_kg_minor={"zone-a": 9 * 10 ** 6},
             minimum_charge_minor=0, fuel_surcharge_permille=0, accessorials=[])
 
         result = quote(document, dict(SHIPMENT, actual_weight_g=0, volume_mm3=10 ** 12))
 
-        assert result["quote"]["total_minor"] == 10 ** 21
+        assert result["quote"]["total_minor"] == 9 * 10 ** 15
         assert isinstance(result["quote"]["total_minor"], int)
 
     def test_a_thousand_versions_resolve_to_the_last_effective_one(self):
@@ -528,3 +533,59 @@ class TestLegalButSurprising:
                                  "service_id": "ground", "carrier_id": "acme"}]}
 
         assert canonical_json(quote(DOCUMENT, SHIPMENT)) == canonical_json(quote(shuffled, SHIPMENT))
+
+
+# ------------------------------------------------------------ the exact-integer ceiling (M2)
+
+CEILING = 2**53 - 1
+
+
+def ceiling_quote(rate_per_kg=450, volume_mm3=0, accessorials=(), requested=(), **tariff):
+    document = tariff_document(**dict(
+        {"minimum_charge_minor": 0, "fuel_surcharge_permille": 0}, **tariff,
+        cost_per_dimensional_kg_minor={"zone-a": rate_per_kg}, accessorials=list(accessorials)))
+    shipment = dict(SHIPMENT, actual_weight_g=1000, volume_mm3=volume_mm3,
+                    requested_accessorials=list(requested))
+    return quote(document, shipment)
+
+
+class TestQuoteAmountsAreHeldToTheExactIntegerCeiling:
+    def test_a_total_exactly_at_the_ceiling_is_answered_exactly(self):
+        result = ceiling_quote(rate_per_kg=CEILING)
+        assert result["quote"]["base_charge_minor"] == CEILING
+        assert result["quote"]["total_minor"] == CEILING
+
+    def test_a_base_charge_one_above_the_ceiling_is_refused(self):
+        with pytest.raises(CommerceInputError) as caught:
+            ceiling_quote(rate_per_kg=CEILING + 1)
+        assert str(caught.value) == (
+            f"quote amount {CEILING + 1} is above {CEILING} and cannot be represented exactly")
+
+    def test_a_fuel_surcharge_above_the_ceiling_is_refused_with_its_own_value(self):
+        with pytest.raises(CommerceInputError) as caught:
+            ceiling_quote(rate_per_kg=9 * 10**15, fuel_surcharge_permille=2000)
+        assert str(caught.value) == (
+            f"quote amount {18 * 10**15} is above {CEILING} and cannot be represented exactly")
+
+    def test_an_accessorial_above_the_ceiling_is_refused_with_its_own_value(self):
+        with pytest.raises(CommerceInputError) as caught:
+            ceiling_quote(accessorials=[{"accessorial_id": "liftgate", "flat_charge_minor": CEILING + 1}],
+                          requested=["liftgate"])
+        assert str(caught.value) == (
+            f"quote amount {CEILING + 1} is above {CEILING} and cannot be represented exactly")
+
+    def test_an_accessorial_exactly_at_the_ceiling_is_answered(self):
+        result = ceiling_quote(rate_per_kg=0, accessorials=[
+            {"accessorial_id": "liftgate", "flat_charge_minor": CEILING}], requested=["liftgate"])
+        assert result["quote"]["total_minor"] == CEILING
+
+    def test_a_total_above_the_ceiling_is_refused_when_every_component_is_inside(self):
+        with pytest.raises(CommerceInputError) as caught:
+            ceiling_quote(rate_per_kg=5 * 10**15, fuel_surcharge_permille=1000)
+        assert str(caught.value) == (
+            f"quote amount {10**16} is above {CEILING} and cannot be represented exactly")
+
+    def test_the_dimensional_weight_is_checked_before_the_charges(self):
+        with pytest.raises(CommerceInputError) as caught:
+            ceiling_quote(rate_per_kg=CEILING + 1, volume_mm3=(CEILING + 1) * 5000)
+        assert str(caught.value).startswith(f"quote amount {CEILING + 1} is above")

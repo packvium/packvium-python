@@ -69,6 +69,22 @@ def test_mixed_fraction_takes_its_sign_from_the_text():
     assert _fraction("1 1/2") == Fraction(3, 2)
 
 
+@pytest.mark.parametrize(
+    "text",
+    ["1e2", "1E2", "1e3000000", "1_00", "\uff11\uff10", "\u0661\u0660", "1.\u0665", ".5", "5.", "nan", "Infinity",
+     "\uff11/\uff12", "1 \u0661/\u0662", "1e3 g", "1e3 mm"],
+)
+def test_only_ascii_decimals_and_fractions_are_measures(text):
+    """The grammar of docs/UNITS-AND-NUMERICS.md: exponent, underscore, non-ASCII digit and
+    bare-dot forms are refused before a Decimal is built, as the other engines refuse them."""
+    with pytest.raises(InvalidRequestError):
+        _fraction(text)
+    with pytest.raises(InvalidRequestError):
+        Length.parse(text)
+    with pytest.raises(InvalidRequestError):
+        Weight.parse(text)
+
+
 def test_accepted_scalar_types():
     assert Length.of(2, "mm") == Length.of("2", "mm")
     assert Length.of(Decimal("2.5"), "mm") == Length.of("2.5", "mm")
@@ -287,3 +303,18 @@ def test_parsed_measures_refuse_a_bad_object_on_every_read(spelling, error, mess
         with pytest.raises(type(direct.value), match=message) as caught:
             measures.read(Length, spelling, "mm")
         assert str(caught.value) == str(direct.value)
+
+
+# Short ids: pytest puts a test's id in PYTEST_CURRENT_TEST, and Windows caps a variable at 32767.
+@pytest.mark.parametrize("text", ["9" * 1_000_000, "1" * 5000, "1" * 5000 + "/1", "1 " + "1" * 5000 + "/1"],
+                         ids=["a-million-digits", "5000-digits", "5000-digit-numerator", "5000-digit-mixed-fraction"])
+def test_a_measure_past_every_maximum_is_read_in_linear_time_and_stays_past_it(text):
+    """A long measure is saturated rather than read digit by digit: `Fraction(Decimal(...))` took
+    48 s on a million digits, and `int` refuses past 4300 digits."""
+    assert _fraction(text) > 10 ** 60
+
+
+def test_leading_zeros_are_not_significant_digits():
+    assert _fraction("0" * 5000 + "100") == 100
+    assert _fraction("0" * 5000 + "100/1") == 100
+    assert _fraction("-" + "0" * 5000 + "12.50") == Fraction(-25, 2)

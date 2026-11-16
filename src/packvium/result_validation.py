@@ -275,6 +275,12 @@ class ContainerSpec:
     #: 1.10: a gusseted bag's side gusset depth G in ticks, which widens the width girth to
     #: b + c <= W + G; 0 for a flat bag and every rigid container.
     side_gusset: int = 0
+    #: 1.11: a gusseted bag's bottom gusset depth K in ticks, which lengthens the
+    #: length girth to 2(a + c) <= 2L + K; 0 where none is declared.
+    bottom_gusset: int = 0
+    #: A bag standing on its bottom gusset, whose `inner` is then the `W x H x L`
+    #: frame it is packed in.
+    standing: bool = False
     #: Whether a packed instance must report `achieved_dimensions`: a flat bag or a
     #: made-to-measure box. Either way it is the tight extent of the placements.
     reports_achieved_extent: bool = False
@@ -409,8 +415,12 @@ def _parse_containers(request: dict, unit: str) -> dict[str, ContainerSpec]:
             )
             for axle in raw_axles
         )
-        inner, deck = _frame_and_deck(dimensions_to_ticks(raw["inner_dimensions"], unit),
-                                      raw.get("pallet_overhang_limit"), unit)
+        boundary = raw.get("deformable_boundary")
+        standing = boundary is not None and boundary.get("orientation") == "standing"
+        declared = dimensions_to_ticks(raw["inner_dimensions"], unit)
+        if standing:
+            declared = (declared[1], declared[2], declared[0])
+        inner, deck = _frame_and_deck(declared, raw.get("pallet_overhang_limit"), unit)
         containers[raw["id"]] = ContainerSpec(
             id=raw["id"],
             inner=inner,
@@ -441,7 +451,9 @@ def _parse_containers(request: dict, unit: str) -> dict[str, ContainerSpec]:
             ),
             rate_table=raw.get("rate_table"),
             flat_bag=raw.get("deformable_boundary") is not None,
-            side_gusset=_side_gusset(raw.get("deformable_boundary"), unit),
+            side_gusset=_gusset(boundary, "side_gusset_depth", unit),
+            bottom_gusset=_gusset(boundary, "bottom_gusset_depth", unit),
+            standing=standing,
             reports_achieved_extent=(raw.get("deformable_boundary") is not None
                                      or raw.get("made_to_measure") is not None
                                      or deck is not None),
@@ -451,11 +463,11 @@ def _parse_containers(request: dict, unit: str) -> dict[str, ContainerSpec]:
     return containers
 
 
-def _side_gusset(boundary: dict | None, unit: str) -> int:
-    """A gusseted bag's side gusset depth in ticks, else 0."""
-    if boundary is None or boundary.get("side_gusset_depth") is None:
+def _gusset(boundary: dict | None, name: str, unit: str) -> int:
+    """A gusseted bag's side or bottom gusset depth in ticks, else 0."""
+    if boundary is None or boundary.get(name) is None:
         return 0
-    return to_ticks(boundary["side_gusset_depth"], unit, LENGTH_TICKS)
+    return to_ticks(boundary[name], unit, LENGTH_TICKS)
 
 
 def _frame_and_deck(declared: tuple[int, int, int], limit: dict | None,
@@ -798,8 +810,30 @@ def _fits_empty(container: ContainerSpec, size: tuple[int, int, int]) -> bool:
     bag, both girth sums with the envelope alone at the origin."""
     if any(size[index] > container.inner[index] for index in range(3)):
         return False
-    return not container.flat_bag or (size[0] + size[2] <= container.inner[0]
-                                      and size[1] + size[2] <= container.inner[1] + container.side_gusset)
+    return not container.flat_bag or _girth_breach(container, *size) is None
+
+
+def _girth_breach(spec: ContainerSpec, a: int, b: int, c: int) -> str | None:
+    """How a bag's package of extents `(a, b, c)` breaks a loop of film, or `None`.
+
+    Lying flat on an `L x W` bag: `2(a + c) <= 2L + K` and `b + c <= W + G`. Standing in its
+    `W x H x L` frame: `2(b + c) <= 2L + K` and `a + b <= W + G` (1.10). `G`
+    and `K` are the side and bottom gussets, 0 where none is declared.
+    """
+    if spec.standing:
+        width, length = spec.inner[0], spec.inner[2]
+        along, across = (b, c), (a, b)
+    else:
+        length, width = spec.inner[0], spec.inner[1]
+        along, across = (a, c), (b, c)
+    if 2 * sum(along) <= 2 * length + spec.bottom_gusset and sum(across) <= width + spec.side_gusset:
+        return None
+    if spec.standing:
+        sums = f"b + c = {b + c}, a + b = {a + b}, standing, length {length}, width {width}"
+    else:
+        sums = f"a + c = {a + c}, b + c = {b + c}, flat size {length} x {width}"
+    return (sums + (f", side gusset {spec.side_gusset}" if spec.side_gusset else "")
+            + (f", bottom gusset {spec.bottom_gusset}" if spec.bottom_gusset else ""))
 
 
 def _achieved_extent(packed: dict, clearance: int) -> tuple[int, int, int]:
@@ -828,11 +862,9 @@ def _check_achieved_extent(packed: dict, spec: ContainerSpec, clearance: int,
     if stated != (a, b, c):
         issues.append(Issue("achieved_dimensions_mismatch",
                             f"{packed['id']}: reported {stated}, computed {(a, b, c)}"))
-    if spec.flat_bag and (a + c > spec.inner[0] or b + c > spec.inner[1] + spec.side_gusset):
-        issues.append(Issue("bag_girth_exceeded",
-                            f"{packed['id']}: a + c = {a + c}, b + c = {b + c}, "
-                            f"flat size {spec.inner[0]} x {spec.inner[1]}"
-                            + (f", side gusset {spec.side_gusset}" if spec.side_gusset else "")))
+    breach = _girth_breach(spec, a, b, c) if spec.flat_bag else None
+    if breach is not None:
+        issues.append(Issue("bag_girth_exceeded", f"{packed['id']}: {breach}"))
 
 
 def _fabricated_side(achieved: int, minimum: int, increment: int) -> int:
@@ -2710,7 +2742,12 @@ BOUND_ORDERS: dict[str, tuple[int | str, ...]] = {
     "maximum_value": (0, "value_forgone", 1, 2, 3),
     "open_dimension_height": (0, "achieved_height", 1, 2, 3),
     "maximum_volume": ("unpacked_volume_ppm", 0, 1, 2, 3),
+    "shipping_cost": (0, "billed_weight", 1, 3, 4),
+    "lowest_landed_cost": (0, "landed_charge", 1, 3, 4),
 }
+
+#: The objectives whose own key is what a carrier bills.
+BILLED_BOUND_OBJECTIVES = ("shipping_cost", "lowest_landed_cost")
 
 #: The one refusal predicate's two ceilings.
 MAX_BOUND_SUM = 10 ** 30
@@ -2942,7 +2979,13 @@ def _stated_bound(request: dict, status: Any, items: dict[str, ItemSpec],
     bound = lower_bound(volumes, weights, shrinks, bound_containers)
     if bound is None:
         return None, "the request is past a declared ceiling"
+    if objective_name in BILLED_BOUND_OBJECTIVES:
+        billed = _billed_term(objective_name, request.get("configuration", {}), containers,
+                              volumes, weights, shrinks, bound)
+        if billed is None:
+            return None, "no priceable inventory carries a packing that attains the count bound"
     stated = tuple(bound[position] if isinstance(position, int)
+                   else billed if position in ("billed_weight", "landed_charge")
                    else _objective_term(position, items, volumes, shrinks, bound_containers, bound[0])
                    for position in order)
     if any(value > MAX_BOUND_VALUE for value in stated):
@@ -2970,6 +3013,109 @@ def _objective_term(name: str, items: dict[str, ItemSpec], volumes: Runs, shrink
     if requested == 0 or capacity is None:
         return 0
     return _ceil_div(max(0, requested - capacity) * SCORE_SCALE, requested)
+
+
+def _least_of_inventory(values: Sequence[tuple[int, int | None]], count: int) -> int | None:
+    """The `count` smallest of `{value repeated quantity}`, summed; `None` if fewer exist."""
+    total = 0
+    for value, quantity in sorted(values, key=lambda pair: pair[0]):
+        if count <= 0:
+            break
+        taken = count if quantity is None else min(quantity, count)
+        total += value * taken
+        count -= taken
+    return None if count > 0 else total
+
+
+def _fractional_cover(offers: Sequence[tuple[int, int, int | None]], need: int) -> int | None:
+    """Least cost covering `need` from `(cost, capacity, quantity)` offers taken fractionally,
+    rounded up; greedy by cost per unit is optimal for one covering constraint."""
+    if need <= 0:
+        return 0
+    remaining, total = Fraction(need), Fraction(0)
+    for cost, capacity, quantity in sorted((o for o in offers if o[1] > 0),
+                                           key=lambda o: Fraction(o[0], o[1])):
+        share = remaining / capacity if quantity is None else min(remaining / capacity, Fraction(quantity))
+        total += share * cost
+        remaining -= share * capacity
+        if remaining <= 0:
+            return -(-total.numerator // total.denominator)
+    return None
+
+
+def _billed_term(objective: str, configuration: dict, containers: dict[str, ContainerSpec],
+                 volumes: Runs, weights: Runs, shrinks: bool, bound: Sequence[int]) -> int | None:
+    """The billed key of `shipping_cost` or `lowest_landed_cost`, or `None` when no
+    priceable inventory carries a packing that leaves exactly `L0` behind.
+
+    Recomputed from the request alone. Each opened container bills at least
+    `max(tare, dimensional)` -- the dimensional weight of its declared outer size, else its
+    declared floor and height, and 0 for a bag, whose billed package can be smaller -- and at
+    least its tare plus what it carries. A rate-table bracket is reachable from a floor within
+    it; there a container carries at most the bracket's bound less its tare (and its
+    `max_payload`), so at most the lightest-first count under that, its usable volume and
+    `max_items`. The cheapest reachable charge over the `L1` containers, the cheapest cover of
+    the placed weight and of the placed count each bound the charge; the largest is stated.
+    O(c b t + c b log(c b)) for `t` runs and `b` brackets per type: `_fit` walks the runs per offer.
+    """
+    divisor = configuration.get("dimensional_weight_divisor")
+    if divisor is None:
+        return None
+    length_unit = configuration.get("dimensional_weight_length_unit", "in")
+    weight_unit = configuration.get("dimensional_weight_weight_unit", "lb")
+    unpacked, opened = bound[0], bound[1]
+    placed = _run_count(volumes) - unpacked
+    specs = list(containers.values())
+    floors = []
+    for spec in specs:
+        size = (spec.outer if spec.outer is not None else spec.inner if spec.deck is None
+                else (spec.deck[2], spec.deck[3], spec.inner[2]))
+        dimensional = 0 if spec.flat_bag else _dimensional_weight_ticks(
+            size, int(divisor), length_unit, weight_unit)
+        floors.append(max(spec.tare_weight, dimensional))
+    if objective == "shipping_cost":
+        if opened == 0:
+            return 0
+        by_floor = _least_of_inventory([(f, s.quantity) for f, s in zip(floors, specs)], opened)
+        by_tare = _least_of_inventory([(s.tare_weight, s.quantity) for s in specs], opened)
+        if by_floor is None or by_tare is None:
+            return None
+        return max(by_floor, by_tare + _smallest(weights, placed))
+    if opened == 0 or placed == 0:
+        return 0
+    cheapest, by_weight, by_items = [], [], []
+    for floor, spec in zip(floors, specs):
+        table = spec.rate_table or {"weight_brackets_g": [], "prices_minor": []}
+        minimum = int(table.get("minimum_charge_minor", 0))
+        permille = int(table.get("fuel_surcharge_permille", 0))
+        charges = []
+        for grams, price in zip(table["weight_brackets_g"], table["prices_minor"]):
+            limit = int(grams) * WEIGHT_TICKS["g"]
+            if floor > limit:
+                continue
+            base = max(int(price), minimum)
+            charge = base + -(-base * permille // 1000)
+            carried = limit - spec.tare_weight
+            if spec.max_payload is not None:
+                carried = min(carried, spec.max_payload)
+            count = _fit(weights, carried)
+            if not shrinks:
+                volume = spec.inner[0] * spec.inner[1] * spec.inner[2]
+                scaled = _ratio_ppm(spec.void_fill_reserve_ratio)
+                usable = volume - ((volume // SCORE_SCALE) * scaled
+                                   + ((volume % SCORE_SCALE) * scaled) // SCORE_SCALE)
+                count = min(count, _fit(volumes, usable))
+            if spec.max_items is not None:
+                count = min(count, spec.max_items)
+            charges.append(charge)
+            by_weight.append((charge, carried, spec.quantity))
+            by_items.append((charge, count, spec.quantity))
+        if charges:
+            cheapest.append((min(charges), spec.quantity))
+    terms = (_least_of_inventory(cheapest, opened),
+             _fractional_cover(by_weight, _smallest(weights, placed)),
+             _fractional_cover(by_items, placed))
+    return None if any(term is None for term in terms) else max(terms)
 
 
 def _departure(score: Sequence[int], bound: Sequence[int]) -> tuple[int, int] | None:

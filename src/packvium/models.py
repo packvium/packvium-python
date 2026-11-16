@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import field
+from dataclasses import field, fields
+from types import MappingProxyType
 
 from ._compat import dataclass
 from typing import Any, Iterable, Mapping
@@ -8,7 +9,8 @@ from typing import Any, Iterable, Mapping
 from ._canonical_json import canonical_identifier
 from .centre_of_mass import centre_of_mass_offset_ppm
 from . import compression, hull
-from .flat_bag import DEFORMABLE_BOUNDARY_KINDS, GUSSETED_BAG, as_dimensions, extent_of
+from .flat_bag import (BAG_ORIENTATIONS, DEFORMABLE_BOUNDARY_KINDS, FLAT, GUSSETED_BAG, STANDING, Girth,
+                       as_dimensions, extent_of, girth_for)
 from .pallet_overhang import Deck, OverhangLimit
 from .pallet_overhang import achieved_dimensions as pallet_achieved, billed_dimensions as pallet_billed
 from .geometry import (ALL_DIRECTIONS, AxisAlignedBox, Dimensions, InvalidDirectionError,
@@ -32,6 +34,21 @@ def _ratio_between_zero_and_one(value: float, name: str) -> None:
         return
     reason = "below_minimum" if value < 0 else "above_maximum" if value > 1 else "invalid_value"
     raise refused(reason, f"{name} must be between 0 and 1")
+
+def _detached(value: Any) -> Any:
+    """A copy of the dicts, lists and tuples in `value`, sharing every other object.
+
+    Enough to keep a caller's later edits out of an admitted request without the deep copy
+    that clones, or fails on, objects a caller keeps in metadata. O(size of the structure).
+    """
+    if isinstance(value, Mapping):
+        return {key: _detached(item) for key, item in value.items()}
+    if type(value) is list:
+        return [_detached(item) for item in value]
+    if type(value) is tuple:
+        return tuple(_detached(item) for item in value)
+    return value
+
 
 @dataclass(frozen=True, slots=True)
 class Obstacle:
@@ -163,6 +180,10 @@ class Item:
         object.__setattr__(self, "incompatible_tags", frozenset(self.incompatible_tags))
         object.__setattr__(self, "eligible_container_tags", frozenset(self.eligible_container_tags))
         object.__setattr__(self, "accepts_stacking_groups", frozenset(self.accepts_stacking_groups))
+        # Detached from the caller's dict (nested values too), so mutating it afterwards cannot
+        # change a request that was already admitted. A copy rather than a read-only view,
+        # since metadata is echoed into results as an ordinary dict.
+        object.__setattr__(self, "metadata", _detached(self.metadata))
         # Coerce here rather than in `create`, so every construction path is covered. An
         # unparsed weight used to travel all the way into the solver before failing.
         object.__setattr__(self, "weight", Weight.parse(self.weight))
@@ -176,6 +197,11 @@ class Item:
         at once: which of them are required, which are forbidden, and what the survivors
         have to be consistent with.
         """
+        # First, so an oversized hull is refused before any per-vertex work runs.
+        if self.hull_vertices is not None and not isinstance(self.hull_vertices, (list, tuple)):
+            raise refused_type("hull_vertices must be a list")
+        if self.hull_vertices is not None and len(self.hull_vertices) > hull.MAXIMUM_HULL_VERTICES:
+            raise refused("above_maximum", f"hull_vertices must have at most {hull.MAXIMUM_HULL_VERTICES} vertices")
         object.__setattr__(self, "shape_type", ShapeType(self.shape_type))
         # The value's own floor first, as the JSON rules check it before the shape.
         if self.max_compression_pressure_kpa is not None and self.max_compression_pressure_kpa < 0:
@@ -379,14 +405,21 @@ class Container:
     # `inner_dimensions` to the frame and drops the limit, so a frame is never widened twice.
     deck: Deck | None = None
     # A `"gusseted_bag"`'s side gusset depth G: its width girth is W + G (1.10, `flat_bag.py`).
-    # Required for that kind and refused for every other container. Last, as above.
+    # A gusseted bag declares it, `bottom_gusset_depth`, or both; every other container
+    # refuses it. Last, as above.
     side_gusset_depth: Length | None = None
+    # A gusseted bag's bottom gusset depth K: its length girth is 2L + K (1.11).
+    bottom_gusset_depth: Length | None = None
+    # `"flat"` or `"standing"` (1.11): a gusseted bag with a bottom gusset may stand on it.
+    bag_orientation: str = FLAT
+    # Set only by `solving_frame`: `inner_dimensions` is the standing `W x H x L` frame, and
+    # `declared_inner` turns it back. A frame is never turned twice.
+    upright_frame: bool = False
 
     def __post_init__(self) -> None:
         if not self.id: raise refused("invalid_value", "container id is required")
         if self.deformable_boundary is not None: self._require_bag_fields()
-        elif self.side_gusset_depth is not None:
-            raise refused("not_allowed", "side_gusset_depth requires deformable_boundary gusseted_bag")
+        else: self._refuse_gusset_fields()
         if self.pallet_overhang_limit is not None: self._require_pallet_fields()
         if self.made_to_measure is not None: self.made_to_measure.admits(as_triple(self.inner_dimensions))
         if self.quantity is not None and self.quantity <= 0: raise refused("below_minimum", "container quantity must be positive")
@@ -398,6 +431,10 @@ class Container:
                 raise refused("invalid_value", "the front axle must be strictly nearer the origin than the rear axle")
             if front.position.ticks < 0 or rear.position.ticks > self.inner_dimensions.length.ticks:
                 raise refused("invalid_value", "axle positions must lie within the container's length")
+        # Read-only before the check below, so the admitted limits cannot be edited afterwards;
+        # pickling, which the concurrent portfolio needs, goes through __getstate__.
+        object.__setattr__(self, "tag_limits", MappingProxyType(dict(self.tag_limits)))
+        object.__setattr__(self, "metadata", _detached(self.metadata))
         if any(limit < 1 for limit in self.tag_limits.values()): raise refused("below_minimum", "tag_limits must be at least 1")
         if self.max_items is not None and self.max_items < 1: raise refused("below_minimum", "container max_items must be at least 1")
         # Deduplicated into the canonical order rather than kept as given: two callers
@@ -417,6 +454,17 @@ class Container:
         if self.max_stack_density is not None:
             object.__setattr__(self, "max_stack_density", Weight.parse(self.max_stack_density))
 
+    def __getstate__(self) -> list[Any]:
+        # A mappingproxy cannot be pickled; the read-only view is rebuilt on restore.
+        return [dict(value) if isinstance(value, MappingProxyType) else value
+                for value in (getattr(self, name.name) for name in fields(self))]
+
+    def __setstate__(self, state: Any) -> None:
+        # Also accepts the dictionary state of a runtime without slots (Python 3.9).
+        for index, name in enumerate(fields(self)):
+            object.__setattr__(self, name.name, state[name.name] if isinstance(state, dict) else state[index])
+        object.__setattr__(self, "tag_limits", MappingProxyType(dict(self.tag_limits)))
+
     def _require_bag_fields(self) -> None:
         """A bag has no walls, floor plan or chassis for a wall-anchored field to refer to,
         so those fields are refused rather than read against a frame that moves with its
@@ -434,25 +482,57 @@ class Container:
         if fields:
             raise refused("not_allowed", f"{fields[0]} cannot be combined with deformable_boundary")
 
+    def _refuse_gusset_fields(self) -> None:
+        """Gusset depths and a standing orientation describe a gusseted bag and nothing else."""
+        for name, present in (("side_gusset_depth", self.side_gusset_depth is not None),
+                              ("bottom_gusset_depth", self.bottom_gusset_depth is not None),
+                              ("orientation", self.bag_orientation != FLAT)):
+            if present:
+                raise refused("not_allowed", f"{name} requires deformable_boundary gusseted_bag")
+
     def _require_gusset_rule(self) -> None:
-        """A gusseted bag's side gusset is required, positive and no deeper than the bag is
-        wide: a deeper fold would have no flat sheet left to fold from. A flat bag takes
-        none. O(1)."""
-        gusseted = self.deformable_boundary == GUSSETED_BAG
-        if self.side_gusset_depth is None:
-            if gusseted: raise refused("missing_field", "a gusseted_bag requires side_gusset_depth")
+        """A gusseted bag declares a side gusset, a bottom gusset or both, each positive. A
+        side gusset is no deeper than the bag is wide and a bottom one no deeper than twice its
+        length: a deeper fold would have no flat sheet left to fold from. Standing needs a
+        bottom gusset to stand on. A flat bag takes none of them. O(1)."""
+        if self.deformable_boundary != GUSSETED_BAG:
+            self._refuse_gusset_fields()
             return
-        if not gusseted:
-            raise refused("not_allowed", "side_gusset_depth requires deformable_boundary gusseted_bag")
-        depth = self.side_gusset_depth.ticks
-        if depth <= 0: raise refused("invalid_value", "side_gusset_depth must be positive")
-        if depth > self.inner_dimensions.width.ticks:
-            raise refused("invalid_value", "side_gusset_depth exceeds inner_dimensions width")
+        declared = self.declared_inner
+        if self.side_gusset_depth is None and self.bottom_gusset_depth is None:
+            raise refused("missing_field", "a gusseted_bag requires side_gusset_depth")
+        for name, depth, limit, what in (
+                ("side_gusset_depth", self.side_gusset_depth, declared.width.ticks,
+                 "inner_dimensions width"),
+                ("bottom_gusset_depth", self.bottom_gusset_depth, 2 * declared.length.ticks,
+                 "twice inner_dimensions length")):
+            if depth is None:
+                continue
+            if depth.ticks <= 0: raise refused("invalid_value", f"{name} must be positive")
+            if depth.ticks > limit: raise refused("invalid_value", f"{name} exceeds {what}")
+        if self.bag_orientation not in BAG_ORIENTATIONS:
+            raise refused("not_allowed", f"orientation must be one of {list(BAG_ORIENTATIONS)}")
+        if self.bag_orientation == STANDING and self.bottom_gusset_depth is None:
+            raise refused("missing_field", "bottom_gusset_depth is required when orientation is standing")
 
     @property
     def side_gusset_ticks(self) -> int:
-        """The gusset depth G in ticks; 0 for a flat bag and every rigid container."""
+        """The side gusset depth G in ticks; 0 for a flat bag and every rigid container."""
         return 0 if self.side_gusset_depth is None else self.side_gusset_depth.ticks
+
+    @property
+    def bottom_gusset_ticks(self) -> int:
+        """The bottom gusset depth K in ticks; 0 where none is declared."""
+        return 0 if self.bottom_gusset_depth is None else self.bottom_gusset_depth.ticks
+
+    @property
+    def girth(self) -> "Girth | None":
+        """A bag's two loops in the frame it is packed in; `None` for a rigid container."""
+        if self.deformable_boundary is None:
+            return None
+        declared = self.declared_inner
+        return girth_for(declared.length.ticks, declared.width.ticks, self.side_gusset_ticks,
+                         self.bottom_gusset_ticks, self.upright_frame)
 
     def _require_pallet_fields(self) -> None:
         """The fields a pallet with an overhang limit refuses: each reads the declared frame
@@ -468,7 +548,11 @@ class Container:
 
     @property
     def declared_inner(self) -> Dimensions:
-        """The inner size the caller declared: a solving frame's deck, else `inner_dimensions`."""
+        """The inner size the caller declared: a solving frame's deck, a standing bag's frame
+        turned back to `L x W x H`, else `inner_dimensions`."""
+        if self.upright_frame:
+            inner = self.inner_dimensions
+            return Dimensions(inner.height, inner.length, inner.width)
         if self.deck is None: return self.inner_dimensions
         return Dimensions(Length(self.deck.length), Length(self.deck.width), self.inner_dimensions.height)
 

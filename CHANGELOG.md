@@ -4,6 +4,41 @@ What changed in `packvium` on PyPI, release by release. The format follows
 [Keep a Changelog](https://keepachangelog.com/1.1.0/) and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.11.0]
+
+Bottom gussets and standing pouches, a certified bound for the shipping objectives, one money
+ceiling, one measure grammar, and request objects that own their mappings.
+
+### Added
+
+- **`deformable_boundary.bottom_gusset_depth` and `orientation: "standing"`** on a
+  `gusseted_bag`. A bottom gusset lengthens the girth along the bag; a standing pouch is packed
+  upright in a `W x H x L` frame. `Container` gains `bottom_gusset_depth`, `bag_orientation` and
+  `girth`.
+- **`optimality.lower_bound` and the gap under `shipping_cost` and `lowest_landed_cost`**;
+  `validate` checks them.
+- **`examples/checkout.py` and `examples/fulfilment.py`.**
+
+### Changed
+
+- **A `rate_table` priced above 9007199254740991 minor units** at its top bracket, surcharge
+  included, is `invalid_request` / `above_maximum`. A commerce quote refuses an amount above it
+  instead of answering, and a revision refuses a stock box priced above it.
+- **Measures are ASCII decimals and fractions only:** `1e2`, `1_00`, `.5`, `5.`, `nan` and
+  non-ASCII digits are `wrong_type`, as in the other engines.
+- **`hull_vertices` holds at most 32 points**; a non-list is `wrong_type` / `must be a list` on
+  the object path too.
+- **`Container.tag_limits` is read-only**, `metadata` is a copy of the caller's dicts and lists,
+  a `CatalogSnapshot` holds tuples and a `Tariff`'s mappings are read-only. Pickling, `copy` and
+  `dataclasses.replace` work as before.
+- **The "why unpacked" reason no longer depends on a 2 s clock.**
+
+### Fixed
+
+- **A very long measure took time quadratic in its length** (48 s for a 1 MB weight); it is
+  refused in milliseconds.
+- **`effort_budget` limits written as `1000.0`** crashed the solver; they now read as integers.
+
 ## [1.10.0]
 
 New request fields, a bound under three more objectives, and the intelligence modules join the

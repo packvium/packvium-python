@@ -45,8 +45,8 @@ Objective key order. `compute` returns the bounds in the *default* objective's o
 `for_request` returns them in the order of the objective a result is scored with:
 `lowest_cost` reads `(L0, L2, L1, L3, L4)`, which the document shows is still a bound;
 `maximum_value`, `open_dimension_height` and `maximum_volume` each add one term for the key
-only they rank by; `shipping_cost` and `lowest_landed_cost` get none, because a
-vector compared against a score that ranks other quantities means nothing.
+only they rank by, and `shipping_cost` and `lowest_landed_cost` one each for what a
+carrier bills, read from the configuration's dimensional-weight divisor.
 
 Which instances. The bound is a property of the request, so it is taken over every instance
 the request declares, fixed placements included. A bound over the free instances
@@ -60,13 +60,19 @@ pack, before any solver runs.
 
 from __future__ import annotations
 
+import bisect
+import functools
 import heapq
-from typing import Dict, Iterable, Sequence, Tuple
+from typing import TYPE_CHECKING, Dict, Iterable, Sequence, Tuple
 
 from ._compat import dataclass
 from .constraints import usable_volume
-from .geometry import ShapeType
+from .geometry import ShapeType, dimensional_weight
 from .models import Container, Item, ItemInstance
+from .units import Weight
+
+if TYPE_CHECKING:
+    from .config import PackingConfig
 
 #: Parts per million, the fixed-point scale keys 3 and 4 of the objective are carried at.
 PPM = 1_000_000
@@ -100,7 +106,33 @@ OBJECTIVE_ORDERS: Dict[str, Tuple["int | str", ...]] = {
     "maximum_value": (0, "value_forgone", 1, 2, 3),
     "open_dimension_height": (0, "achieved_height", 1, 2, 3),
     "maximum_volume": ("unpacked_volume_ppm", 0, 1, 2, 3),
+    "shipping_cost": (0, "billed_weight", 1, 3, 4),
+    "lowest_landed_cost": (0, "landed_charge", 1, 3, 4),
 }
+
+#: The objectives whose own key is what a carrier bills, which needs the configuration's
+#: dimensional-weight divisor and units as well as the request.
+BILLED_OBJECTIVES = ("shipping_cost", "lowest_landed_cost")
+
+
+@dataclass(frozen=True, slots=True)
+class Billing:
+    """What a carrier can bill one container of a type, at the least.
+
+    `tare` and `dimensional` are weight ticks: an opened container is billed
+    `max(tare + payload, dimensional)`, so `max(tare, dimensional)` is its floor whatever it
+    carries. `brackets` is its rate table as `(upper bound in weight ticks, charge in minor
+    units)`, the charge already floored at the minimum and surcharged, or empty where the
+    objective prices nothing.
+    """
+
+    tare: int
+    dimensional: int
+    brackets: Tuple[Tuple[int, int], ...] = ()
+
+    @property
+    def floor(self) -> int:
+        return max(self.tare, self.dimensional)
 
 
 class BoundOverflowError(ValueError):
@@ -262,12 +294,13 @@ def _occupies_less_than_its_box(item: Item) -> bool:
 
 
 def for_request(instances: Sequence[ItemInstance], containers: Sequence[Container],
-                objective: str) -> "Tuple[int, ...] | None":
+                objective: str, config: "PackingConfig | None" = None) -> "Tuple[int, ...] | None":
     """The request's bound in `objective`'s own score order, or `None` where none is stated.
 
     `instances` is every instance the request declares, fixed placements included, and
-    `containers` every type it may open. `None` for an objective with no bound, for a
-    request with a `made_to_measure` container (D13: the unused-volume key would be
+    `containers` every type it may open. `None` for an objective with no bound, for a billed objective whose inventory cannot
+    carry a packing that attains `L0` at a price, for a request with a
+    `made_to_measure` container (D13: the unused-volume key would be
     taken from the machine maximum while the score uses the fabricated box), and for a
     request past a declared ceiling. The last withholds the bound and nothing else: the pack
     is still answered, as it was before any bound existed (OPTIMALITY-GAP.md § 1.5).
@@ -280,23 +313,61 @@ def for_request(instances: Sequence[ItemInstance], containers: Sequence[Containe
     if any(container.made_to_measure is not None for container in containers):
         return None
     try:
-        return objective_vector(instances, containers, objective)
-    except BoundOverflowError:
+        billings = billing_for(containers, config) if objective in BILLED_OBJECTIVES else ()
+        return objective_vector(instances, containers, objective, billings)
+    except (BoundOverflowError, BoundWithheld):
         return None
 
 
+class BoundWithheld(ValueError):
+    """A billed objective's inventory cannot carry, at any price it lists, a packing that
+    attains `L0`; no answer is compared against a bound then, so none is stated."""
+
+
+def billing_for(containers: Sequence[Container], config: "PackingConfig | None") -> Tuple[Billing, ...]:
+    """Each type's `Billing`, from the objective's divisor and units.
+
+    A rigid container is billed on its declared outer size, else its declared inner one; a
+    pallet whose load overhangs is billed larger per side, never smaller, and dimensional
+    weight only grows with each side, so the declared size is a floor. A bag is billed on the
+    package its contents make, which can be smaller than declared, so its floor is 0.
+    """
+    if config is None or config.dimensional_weight_divisor is None:
+        raise BoundWithheld("a billed objective needs configuration.dimensional_weight_divisor")
+    landed = config.objective == "lowest_landed_cost"
+    return tuple(Billing(
+        tare=container.tare_weight.ticks,
+        dimensional=0 if container.is_flat_bag else dimensional_weight(
+            container.outer_dimensions or container.declared_inner,
+            config.dimensional_weight_divisor, config.dimensional_weight_length_unit,
+            config.dimensional_weight_weight_unit).ticks,
+        brackets=_brackets(container) if landed else (),
+    ) for container in containers)
+
+
+def _brackets(container: Container) -> Tuple[Tuple[int, int], ...]:
+    """The rate table as `(bound in weight ticks, charge)`; the charge at a bracket's bound is
+    that bracket's charge, since the bound is the heaviest weight it prices."""
+    table = container.rate_table
+    if table is None:
+        return ()
+    return tuple((bound * Weight.TICKS_PER_G, table.charge_minor_or_none(bound))
+                 for bound in table.weight_brackets_g)
+
+
 def objective_vector(instances: Sequence[ItemInstance], containers: Sequence[Container],
-                     objective: str) -> Tuple[int, ...]:
+                     objective: str, billings: Sequence[Billing] = ()) -> Tuple[int, ...]:
     """The bound in a covered `objective`'s score order, raising `BoundOverflowError` where a
-    ceiling withholds it -- the predicate's or the objective's own term's."""
+    ceiling withholds it -- the predicate's or the objective's own term's -- and
+    `BoundWithheld` where a billed objective has no priceable answer to bound."""
     vector = compute(instances, containers).as_tuple()
     return tuple(vector[position] if isinstance(position, int)
-                 else _objective_term(position, instances, containers, vector[0])
+                 else _objective_term(position, instances, containers, vector, billings)
                  for position in OBJECTIVE_ORDERS[objective])
 
 
 def _objective_term(name: str, instances: Sequence[ItemInstance], containers: Sequence[Container],
-                    unpacked: int) -> int:
+                    vector: Tuple[int, ...], billings: Sequence[Billing]) -> int:
     """The bound on the one key an objective ranks by and the default does not.
 
     Each is conditional on the keys before it, as `compute`'s are: the value and height terms
@@ -308,8 +379,19 @@ def _objective_term(name: str, instances: Sequence[ItemInstance], containers: Se
     `O(n log L0)`. With `O(c)` over the container types, the request bound stays
     `O(n log n + c log c)`.
     """
+    unpacked, opened = vector[0], vector[1]
     if name == "value_forgone":
         return _value_forgone_bound(instances, unpacked)
+    if name in ("billed_weight", "landed_charge"):
+        weights = sorted(instance.weight.ticks for instance in instances)
+        quantities = [container.quantity for container in containers]
+        if name == "billed_weight":
+            return _billed_weight_bound(weights, billings, quantities, unpacked, opened)
+        volumes = sorted(instance.item.dimensions.volume for instance in instances)
+        nests = any(_occupies_less_than_its_box(instance.item) for instance in instances)
+        limits = [(usable_volume(c), None if c.max_payload is None else c.max_payload.ticks,
+                   c.max_items, c.quantity) for c in containers]
+        return _landed_charge_bound(weights, volumes, nests, billings, limits, unpacked, opened)
     volumes = [instance.item.dimensions.volume for instance in instances]
     nests = any(_occupies_less_than_its_box(instance.item) for instance in instances)
     if name == "achieved_height":
@@ -317,6 +399,127 @@ def _objective_term(name: str, instances: Sequence[ItemInstance], containers: Se
         return _achieved_height_bound(volumes, nests, unpacked, areas)
     usable = [usable_volume(container) for container in containers]
     return _unpacked_volume_bound(volumes, nests, usable, [c.quantity for c in containers])
+
+
+def _smallest_from_inventory(values: Sequence[int], quantities: Sequence["int | None"],
+                             count: int) -> "int | None":
+    """The sum of the `count` smallest of `{value repeated quantity}`, or `None` when the
+    inventory holds fewer. Sorting the types and taking `min(quantity, still needed)` of each
+    is `L2`'s rule, `O(c log c)`, without building the multiset."""
+    total, needed = 0, count
+    for value, quantity in sorted(zip(values, quantities), key=lambda pair: pair[0]):
+        if needed == 0:
+            break
+        taken = needed if quantity is None else min(quantity, needed)
+        total += value * taken
+        needed -= taken
+    return None if needed else total
+
+
+def _billed_weight_bound(weights: Sequence[int], billings: Sequence[Billing],
+                         quantities: Sequence["int | None"], unpacked: int, opened: int) -> int:
+    """`shipping_cost`'s second key, summed billed weight in ticks.
+
+    A packing that leaves exactly `unpacked` behind opens at least `opened` containers and
+    carries at least the lightest `n - unpacked` instances. Each opened container is billed
+    `max(tare + payload, dimensional)`, at least its floor, and a sum of maxima is at least
+    either sum on its own, so the two can be taken over different types. Every term is
+    non-negative, so opening more only adds. `weights` is ascending.
+    """
+    if opened == 0:
+        return 0
+    floors = _smallest_from_inventory([b.floor for b in billings], quantities, opened)
+    tares = _smallest_from_inventory([b.tare for b in billings], quantities, opened)
+    if floors is None or tares is None:
+        raise BoundWithheld("the inventory holds fewer containers than must be opened")
+    payload = sum(weights[:len(weights) - unpacked])
+    return _guard_output(max(floors, tares + payload), "billed weight")
+
+
+def _landed_charge_bound(weights: Sequence[int], volumes: Sequence[int], nests: bool,
+                         billings: Sequence[Billing],
+                         limits: Sequence[Tuple[int, "int | None", "int | None", "int | None"]],
+                         unpacked: int, opened: int) -> int:
+    """`lowest_landed_cost`'s second key, the summed carrier charge in minor units.
+
+    Every opened container is billed in exactly one bracket and pays its charge. A container
+    in bracket `(bound, charge)` weighs at most `bound`, so it is reachable only when its floor
+    is within it, carries at most `bound - tare` of payload (and its `max_payload`), and at
+    most as many instances as the lightest-first count under that payload, its usable volume
+    and `max_items`. Three relaxations of that assignment hold, and the largest is the bound:
+    the cheapest reachable charge per container over `opened` containers; the least cost
+    covering the placed weight; the least cost covering the placed count. Prices need not rise
+    with weight, which is why a bracket is chosen rather than read off the floor. A type no
+    bracket prices offers nothing: a packing that opens one is refused, never returned.
+    `weights` and `volumes` are ascending; `limits` is `(usable, max_payload, max_items,
+    quantity)` per type. `O(c b log n + c b log(c b))` for `b` brackets per type.
+    """
+    placed = len(weights) - unpacked
+    if opened == 0 or placed == 0:
+        return 0
+    payload_prefix = _prefix_sums(weights)
+    volume_prefix = None if nests else _prefix_sums(volumes)
+    cheapest, quantities, offers = [], [], []
+    for billing, (usable, max_payload, max_items, quantity) in zip(billings, limits):
+        reachable = [(bound, charge) for bound, charge in billing.brackets
+                     if charge is not None and billing.floor <= bound]
+        if not reachable:
+            continue
+        cheapest.append(min(charge for _, charge in reachable))
+        quantities.append(quantity)
+        for bound, charge in reachable:
+            carried = bound - billing.tare
+            if max_payload is not None:
+                carried = min(carried, max_payload)
+            count = _fit_prefix(payload_prefix, carried)
+            if volume_prefix is not None:
+                count = min(count, _fit_prefix(volume_prefix, usable))
+            if max_items is not None:
+                count = min(count, max_items)
+            offers.append((charge, carried, count, quantity))
+    by_count = _smallest_from_inventory(cheapest, quantities, opened)
+    by_weight = _cover([(charge, carried, quantity) for charge, carried, _, quantity in offers],
+                       payload_prefix[placed - 1])
+    by_items = _cover([(charge, count, quantity) for charge, _, count, quantity in offers], placed)
+    if by_count is None or by_weight is None or by_items is None:
+        raise BoundWithheld("no priceable inventory carries a packing that attains L0")
+    return _guard_output(max(by_count, by_weight, by_items), "landed charge")
+
+
+def _prefix_sums(ascending: Sequence[int]) -> list:
+    totals, running = [], 0
+    for value in ascending:
+        running += value
+        totals.append(running)
+    return totals
+
+
+def _fit_prefix(prefix: Sequence[int], capacity: int) -> int:
+    """`_fit` by binary search over prefix sums, `O(log n)` per question."""
+    return bisect.bisect_right(prefix, capacity)
+
+
+def _cover(offers: Sequence[Tuple[int, int, "int | None"]], need: int) -> "int | None":
+    """The least cost covering `need` units from `(cost, capacity, quantity)` offers, taken
+    fractionally and rounded up, or `None` when the offers cannot cover it.
+
+    A fractional covering problem with one constraint is solved exactly by taking offers in
+    order of cost per unit. Only the last offer is taken in part, so the cost is an integer
+    plus one ceiling and no fraction is carried. Offers of equal cost per unit give the same
+    total in either order, so the order needs no tie-break. Each offer is limited by its
+    type's whole inventory, which only weakens the bound.
+    """
+    if need <= 0:
+        return 0
+    ranked = sorted((offer for offer in offers if offer[1] > 0),
+                    key=functools.cmp_to_key(lambda a, b: a[0] * b[1] - b[0] * a[1]))
+    total = 0
+    for cost, capacity, quantity in ranked:
+        if quantity is None or quantity * capacity >= need:
+            return total + _ceil_div(cost * need, capacity)
+        total += cost * quantity
+        need -= capacity * quantity
+    return None
 
 
 def _value_forgone_bound(instances: Sequence[ItemInstance], unpacked: int) -> int:

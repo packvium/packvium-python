@@ -8,7 +8,7 @@ from packvium import PackingConfig
 from packvium.config import SolverProfile
 from packvium.extensions import LandedCostSolutionScorer
 from packvium.fixed_placements import FixedPlacementError
-from packvium.flat_bag import fits_alone, girth_admits
+from packvium.flat_bag import fits_alone, girth_for
 from packvium.geometry import Dimensions, Point, Rotation
 from packvium.models import (Container, Item, ItemInstance, PackedContainer, PackingRequest,
                              Placement, RateTable)
@@ -19,6 +19,15 @@ from packvium.solvers import (ContainerState, Deadline, GridSolver, HomogeneousB
 from packvium.units import Length, Weight
 from packvium.validation import IndependentSolutionValidator
 
+
+
+def _girth(inner, gusset=0, bottom=0):
+    """The flat frame's loops for a bag declared `inner`, through the engine's own builder."""
+    return girth_for(inner.length.ticks, inner.width.ticks, gusset, bottom, False)
+
+
+def _admits(inner, a, b, c, gusset=0):
+    return _girth(inner, gusset).admits((a, b, c))
 
 def ticks(millimetres: int) -> int:
     return Length.of(millimetres, "mm").ticks
@@ -58,16 +67,16 @@ def gusseted(depth: object) -> dict:
 class TestTheRule:
     def test_the_gusset_widens_only_the_width_girth(self):
         inner = mm(300, 150, 100)
-        assert not girth_admits(inner, ticks(200), ticks(100), ticks(60))
-        assert girth_admits(inner, ticks(200), ticks(100), ticks(60), ticks(10))
-        assert not girth_admits(inner, ticks(200), ticks(100), ticks(60) + 1, ticks(10))
-        assert not girth_admits(inner, ticks(241), 0, ticks(60), ticks(150))
+        assert not _admits(inner, ticks(200), ticks(100), ticks(60))
+        assert _admits(inner, ticks(200), ticks(100), ticks(60), ticks(10))
+        assert not _admits(inner, ticks(200), ticks(100), ticks(60) + 1, ticks(10))
+        assert not _admits(inner, ticks(241), 0, ticks(60), ticks(150))
 
     def test_a_single_box_fits_a_gusseted_bag_its_flat_twin_refuses(self):
         inner = mm(200, 150, 100)
-        assert not fits_alone(inner, mm(100, 100, 60))
-        assert fits_alone(inner, mm(100, 100, 60), ticks(10))
-        assert not fits_alone(inner, mm(100, 160, 10), ticks(150))
+        assert not fits_alone(inner, mm(100, 100, 60), _girth(inner))
+        assert fits_alone(inner, mm(100, 100, 60), _girth(inner, ticks(10)))
+        assert not fits_alone(inner, mm(100, 160, 10), _girth(inner, ticks(150)))
 
 
 class TestTheModel:

@@ -108,6 +108,7 @@ class ItemMaster:
 
     def __post_init__(self) -> None:
         _require_id("item", self.id)
+        object.__setattr__(self, "dimensions_mm", tuple(self.dimensions_mm))
         if len(self.dimensions_mm) != 3:
             raise ValueError("item dimensions must have exactly three axes")
         _require_positive_dimensions("item", self.dimensions_mm)
@@ -126,6 +127,7 @@ class CartonMaster:
 
     def __post_init__(self) -> None:
         _require_id("carton", self.id)
+        object.__setattr__(self, "inner_dimensions_mm", tuple(self.inner_dimensions_mm))
         if len(self.inner_dimensions_mm) != 3:
             raise ValueError("carton dimensions must have exactly three axes")
         _require_positive_dimensions("carton", self.inner_dimensions_mm)
@@ -146,6 +148,7 @@ class PalletMaster:
 
     def __post_init__(self) -> None:
         _require_id("pallet", self.id)
+        object.__setattr__(self, "deck_dimensions_mm", tuple(self.deck_dimensions_mm))
         if len(self.deck_dimensions_mm) != 2:
             raise ValueError("pallet deck dimensions must have exactly two axes")
         _require_positive_dimensions("pallet", self.deck_dimensions_mm)
@@ -244,6 +247,9 @@ class CatalogSnapshot(_SnapshotLookupCache):
     overrides: tuple[FacilityOverride, ...] = ()
 
     def __post_init__(self) -> None:
+        # Tuples detached from the caller's lists, so published history cannot be edited later.
+        for name in ("items", "cartons", "pallets", "exclusions", "overrides"):
+            object.__setattr__(self, name, tuple(getattr(self, name)))
         _require_unique_ids("item", self.items)
         _require_unique_ids("carton", self.cartons)
         _require_unique_ids("pallet", self.pallets)
@@ -261,8 +267,6 @@ class CatalogSnapshot(_SnapshotLookupCache):
 
 
     def _lookup(self, entries, id, kind, entry_type):
-        if type(entries) is not tuple:
-            return _find(entries, id, kind)
         indexes = getattr(self, "_entry_indexes", {})
         index = indexes.get(kind)
         if index is None:
@@ -283,8 +287,10 @@ class CatalogSnapshot(_SnapshotLookupCache):
 
     def __setstate__(self, state):
         # Also accept the dictionary state produced by older non-slotted runtimes.
+        # Tuples again, as __post_init__ makes them: a snapshot pickled before 1.11 holds lists.
         for index, field in enumerate(fields(self)):
-            object.__setattr__(self, field.name, state[field.name] if isinstance(state, dict) else state[index])
+            value = state[field.name] if isinstance(state, dict) else state[index]
+            object.__setattr__(self, field.name, tuple(value))
 
 
 # ------------------------------------------------------------------------------- version

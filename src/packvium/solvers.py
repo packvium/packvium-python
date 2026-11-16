@@ -657,12 +657,16 @@ def _prepare_candidate_search(
             return None
     inner = container.inner_dimensions
     limit_x, limit_y, limit_z = inner.length.ticks, inner.width.ticks, inner.height.ticks
-    # A bag also needs a + c <= L and b + c <= W + G over the running extents grown by the
-    # candidate (G is a gusseted bag's side gusset, 0 for a flat one): O(1), and
-    # the extents only grow, so no admitted verdict flips. W + G is summed once per call.
-    bag = container.is_flat_bag
+    # A bag also needs both loops of film round the running extents grown by the candidate:
+    # lying flat 2(a + c) <= 2L + K and b + c <= W + G, standing 2(b + c) <= 2L + K and
+    # a + b <= W + G (1.10 side gussets, bottom gussets; `flat_bag.Girth`).
+    # O(1), and the extents only grow, so no admitted verdict flips. Both limits are summed
+    # once per call.
+    girth = container.girth
+    bag = girth is not None
     bag_x, bag_y, bag_z = state.max_x, state.max_y, state.max_z
-    girth_y = limit_y + container.side_gusset_ticks
+    along, across = (girth.along_limit, girth.across_limit) if bag else (0, 0)
+    standing = bag and container.upright_frame
     clearance = config.clearance.ticks
     # Envelope and extents depend only on the rotation, so they are built once instead
     # of once per (point, rotation) pair.
@@ -717,7 +721,7 @@ def _prepare_candidate_search(
         state, container, item, config, forms, placed, stack_sensitive, route_sensitive,
         bounds, hull_shapes, index, nesting, placement_offset, reserve_check, usable,
         compression_sensitive, active, inert_chain, inert_support_checks, tracing,
-        limit_x, limit_y, limit_z, bag, bag_x, bag_y, bag_z, girth_y, clearance,
+        limit_x, limit_y, limit_z, bag, bag_x, bag_y, bag_z, along, across, standing, clearance,
     )
 
 
@@ -732,7 +736,7 @@ def _scan_candidate_points(
         state, container, item, config, forms, placed, stack_sensitive, route_sensitive,
         bounds, hull_shapes, index, nesting, placement_offset, reserve_check, usable,
         compression_sensitive, active, inert_chain, inert_support_checks, tracing,
-        limit_x, limit_y, limit_z, bag, bag_x, bag_y, bag_z, girth_y, clearance,
+        limit_x, limit_y, limit_z, bag, bag_x, bag_y, bag_z, along, across, standing, clearance,
     ) = prepared
     candidates: list[Candidate] = []
     best: Candidate | None = None
@@ -769,11 +773,14 @@ def _scan_candidate_points(
         x1, y1, z1 = point.x, point.y, point.z
         for rotation, physical, envelope, dx, dy, dz, shape in point_forms:
             x2, y2, z2 = x1 + dx, y1 + dy, z1 + dz
-            # Conditional expressions rather than `max()`: the builtin call made this test
-            # four times dearer per bag candidate (75 ns against 309 ns, CPython 3.11).
-            if x2 > limit_x or y2 > limit_y or z2 > limit_z or (
-                    bag and ((x2 if x2 > bag_x else bag_x) + (thickness := z2 if z2 > bag_z else bag_z) > limit_x
-                             or (y2 if y2 > bag_y else bag_y) + thickness > girth_y)):
+            # Conditional expressions rather than `max()` or a helper call: either made this
+            # test several times dearer per bag candidate (75 ns against 309 ns for `max()`,
+            # CPython 3.11).
+            if x2 > limit_x or y2 > limit_y or z2 > limit_z or (bag and (
+                    (2 * ((grown_y := y2 if y2 > bag_y else bag_y) + (grown_z := z2 if z2 > bag_z else bag_z)) > along
+                     or (x2 if x2 > bag_x else bag_x) + grown_y > across) if standing else
+                    (2 * ((x2 if x2 > bag_x else bag_x) + (grown_z := z2 if z2 > bag_z else bag_z)) > along
+                     or (y2 if y2 > bag_y else bag_y) + grown_z > across))):
                 if tracing:
                     trace.emit({"type": "filter", "item_id": item.id, "point": {"x": x1, "y": y1, "z": z1}, "rotation": rotation.value, "reason": "boundary"})
                 continue
@@ -1932,19 +1939,42 @@ class HomogeneousBlockSolver:
         return (len(solution.unpacked), -state.used_volume_ticks, state.max_z, signature)
 
     @staticmethod
-    def _block(mode, space, space_volume, item_id, rotation, physical, envelope,
-               nx, ny, nz, count):
-        """A group's winning block with the key the mode ranks it by, smaller first."""
-        used_volume = count * physical.volume
+    def _score(mode, space, space_volume, item_id, rotation, used_volume, nx, ny, nz, count):
+        """The key the mode ranks a group's winning block by, smaller first."""
         space_fill_ppm = used_volume * 1_000_000 // space_volume
         if mode == "count":
             lead = (-count, -space_fill_ppm, -used_volume)
         else:
             lead = (-used_volume, -space_fill_ppm, -count)
-        score = (*lead, space.origin.z, space.origin.y, space.origin.x, item_id, rotation.value,
-                 nx, ny, nz)
+        return (*lead, space.origin.z, space.origin.y, space.origin.x, item_id, rotation.value,
+                nx, ny, nz)
+
+    @classmethod
+    def _block(cls, mode, space, space_volume, item_id, rotation, physical, envelope,
+               nx, ny, nz, count):
+        """A group's winning block with the key the mode ranks it by, smaller first."""
+        used_volume = count * physical.volume
+        score = cls._score(mode, space, space_volume, item_id, rotation, used_volume, nx, ny, nz, count)
         return _HomogeneousBlock(space, item_id, rotation, physical, envelope,
                                  nx, ny, nz, count, used_volume, score)
+
+    @classmethod
+    def _can_lead(cls, mode, last, space, space_volume, item_id, rotation, count, volume,
+                  nx, ny, nz):
+        """Whether a group's block would rank before `last`, the last kept block's key.
+
+        The same answer as comparing the built block's key, reached field by field so the
+        common loser is decided by its first or second field and never has a block or a key
+        built: `-count` or `-used_volume` first, then the space fill, then the whole key."""
+        used_volume = count * volume
+        first = -count if mode == "count" else -used_volume
+        if first != last[0]:
+            return first < last[0]
+        fill = -(used_volume * 1_000_000 // space_volume)
+        if fill != last[1]:
+            return fill < last[1]
+        return cls._score(mode, space, space_volume, item_id, rotation, used_volume,
+                          nx, ny, nz, count) < last
 
     @staticmethod
     def _forms(prototype: ItemInstance, config: PackingConfig) -> tuple[tuple, ...]:
@@ -2084,7 +2114,6 @@ class HomogeneousBlockSolver:
         and whether a limit stopped the round (which then commits nothing)."""
         node_limit = config.container_plan_node_limit
         node_ceiling = deadline._search_node_ceiling(stats)
-        by_count = mode == "count"
         leading: list[_HomogeneousBlock] = []
         # Capacity reads only the committed state, so it is fixed for the whole round.
         types = []
@@ -2127,20 +2156,20 @@ class HomogeneousBlockSolver:
                         return leading, nodes + budget, True
                     nodes += group_nodes
                     stats.search_nodes_expanded += group_nodes
-                    # The key's first field is `-count` or `-used_volume`; a group that
-                    # loses on it to the last kept block loses on the key, so its key is
-                    # never built.
-                    full = len(leading) == leaders
-                    if count and (not full
-                                  or (-count if by_count else -count * volume) <= leading[-1].score[0]):
-                        block = self._block(
-                            mode, space, space_volume, item_id, rotation, physical,
-                            envelope, nx, ny, nz, count,
-                        )
-                        if not full or block.score < leading[-1].score:
-                            leading.append(block)
-                            leading.sort(key=lambda kept: kept.score)
-                            del leading[leaders:]
+                    if not count:
+                        continue
+                    if len(leading) == leaders and not self._can_lead(
+                        mode, leading[-1].score, space, space_volume, item_id, rotation,
+                        count, volume, nx, ny, nz,
+                    ):
+                        continue
+                    block = self._block(
+                        mode, space, space_volume, item_id, rotation, physical,
+                        envelope, nx, ny, nz, count,
+                    )
+                    leading.append(block)
+                    leading.sort(key=lambda kept: kept.score)
+                    del leading[leaders:]
         return leading, nodes, False
 
     def _commit(self, state, best, remaining, config, stats, deadline) -> bool:
@@ -2438,9 +2467,10 @@ def _with_top_loads(placements: Sequence[Placement]) -> tuple[Placement, ...]:
 
 def _fits_alone(container: Container, dimensions: Dimensions) -> bool:
     """Whether one box of these dimensions fits this container empty: the frame, and for a
-    flat bag the girth rule too, so a bag too thin for an item proves it unplaceable."""
-    if container.is_flat_bag:
-        return fits_alone(container.inner_dimensions, dimensions, container.side_gusset_ticks)
+    bag the girth rule too, so a bag too thin for an item proves it unplaceable."""
+    girth = container.girth
+    if girth is not None:
+        return fits_alone(container.inner_dimensions, dimensions, girth)
     return dimensions.fits_inside(container.inner_dimensions)
 
 
@@ -2693,10 +2723,39 @@ def _effort_limited(unpacked: tuple[UnpackedItem, ...], effort_reached: bool) ->
     )
 
 
+def _frozen_clock() -> int:
+    return 0
+
+
+class _SupportDiagnostic:
+    """The verdicts and replayed container states of one final layout.
+
+    Scoped to the layout it was built for: a different `packed` or `config` starts a fresh one.
+    """
+
+    __slots__ = ("config", "packed", "verdicts", "_states")
+
+    def __init__(self, config: PackingConfig, packed: Sequence[PackedContainer]):
+        self.config = config
+        self.packed = packed
+        self.verdicts: dict[str, bool] = {}
+        self._states: dict[int, ContainerState] = {}
+
+    def state(self, index: int, packed_container: PackedContainer) -> ContainerState:
+        state = self._states.get(index)
+        if state is None:
+            state = ContainerState(packed_container.container, packed_container.sequence)
+            for placement in packed_container.placements:
+                state.add(placement)
+            self._states[index] = state
+        return state
+
+
 class SolverOrchestrator:
     def __init__(self, custom_constraints=(), custom_orders=(), custom_solvers=(), container_selector=None):
         self.custom_constraints = tuple(custom_constraints); self.custom_orders = tuple(custom_orders); self.custom_solvers = tuple(custom_solvers)
         self.container_selector = container_selector or DefaultContainerSelector()
+        self._support_diagnostic: "_SupportDiagnostic | None" = None
 
     def _solvers(self, items, config):
         if config.solvers:
@@ -3218,6 +3277,21 @@ class SolverOrchestrator:
         `ReasonProof.for_reason`'s `observed` level and `docs/PUBLIC-API.md`'s
         rejection proof section.
         """
+        # The answer is a function of the item's declared attributes and the final layout,
+        # so every instance of a type shares one verdict -- unless a caller's own constraint
+        # may read the instance itself, in which case each instance is asked. The replayed
+        # container states are likewise built once per layout, not once per unpacked item.
+        diagnostic = self._support_diagnostic
+        if diagnostic is None or diagnostic.config is not config or diagnostic.packed is not packed:
+            diagnostic = self._support_diagnostic = _SupportDiagnostic(config, packed)
+        key = instance.id if self.custom_constraints else instance.item.id
+        verdict = diagnostic.verdicts.get(key)
+        if verdict is None:
+            verdict = diagnostic.verdicts[key] = self._observe_support_blocker(instance, diagnostic)
+        return verdict
+
+    def _observe_support_blocker(self, instance, diagnostic):
+        config = diagnostic.config
         constraints = default_constraints(config, self.custom_constraints)
         support_constraints = tuple(c for c in constraints if isinstance(c, SupportConstraint))
         # The built-in support specification is a strict no-op for this item when it
@@ -3229,16 +3303,13 @@ class SolverOrchestrator:
                for c in support_constraints):
             return False
         without_support = tuple(c for c in constraints if not isinstance(c, SupportConstraint))
-        # A small, fixed local budget -- independent of the caller's own deadline,
-        # which may already be exhausted -- so this diagnostic can never itself hang
-        # the solve; it is a best-effort explanation, not a required step.
-        budget = Deadline(2_000)
-        for packed_container in packed:
-            if budget.expired:
-                return False
-            state = ContainerState(packed_container.container, packed_container.sequence)
-            for placement in packed_container.placements:
-                state.add(placement)
+        # No wall clock: the reason an item is reported unpacked must be a function of the
+        # request and the layout, never of machine load. A frozen clock leaves nothing to
+        # expire; each search is bounded by the layout's own candidate points (one
+        # candidate wanted) and the verdict is memoised per item type.
+        budget = Deadline(0, limit_ns=1, clock=_frozen_clock)
+        for index, packed_container in enumerate(diagnostic.packed):
+            state = diagnostic.state(index, packed_container)
             if not find_candidates(state, instance, config, without_support, SearchStats(), budget, 1):
                 continue
             if not find_candidates(state, instance, config, constraints, SearchStats(), budget, 1):
@@ -3361,8 +3432,8 @@ class SolverOrchestrator:
                 lower = max(lower, (total_weight + maximum_payload - 1) // maximum_payload)
         return lower
 
-    def _plan_bound_key(self, plan, containers, config) -> tuple:
-        partial = list(self._score_plan(plan.packed, (), config))
+    def _plan_bound_key(self, plan, containers, config, partial_score) -> tuple:
+        partial = list(partial_score)
         count_index = 1 if config.objective == "default" else 2
         partial[count_index] += self._additional_container_lower_bound(plan, containers)
         remaining_signature = tuple(item.id for item in plan.remaining)
@@ -3461,10 +3532,12 @@ class SolverOrchestrator:
                 previous = dominant.get(signature)
                 if previous is None or partial_score < previous[0]:
                     dominant[signature] = (partial_score, plan)
-            beam = sorted(
-                (pair[1] for pair in dominant.values()),
-                key=lambda plan: self._plan_bound_key(plan, containers, config),
-            )[:config.container_plan_beam_width]
+            beam = [
+                plan for _, plan in sorted(
+                    dominant.values(),
+                    key=lambda pair: self._plan_bound_key(pair[1], containers, config, pair[0]),
+                )[:config.container_plan_beam_width]
+            ]
 
         unpacked = []
         opened = self._opened_by_type(incumbent.packed)

@@ -5,6 +5,8 @@ from typing import Protocol, Sequence
 
 from .axle_load import axle_load_exceeded
 from .contact import ContactEdge, ContactGraph
+from .loads import LoadUnit, load_units  # noqa: F401  (re-exported: the names predate the move)
+from .ratios import SUPPORT_SCALE, required_area, reserved_volume, scaled_ratio  # noqa: F401  (re-exported likewise)
 from .geometry import (ALL_DIRECTIONS, AxisAlignedBox, Dimensions, InvalidDirectionError,
                        Point, Rotation, sweep_intersects, swept_volume)
 from .models import Container, Item, ItemInstance, Placement
@@ -12,31 +14,6 @@ from .pallet_overhang import deck_contact_area
 from .support_polygon import contact_hull_points, convex_hull, doubled_centroid, point_in_hull
 from .compression import applied_pressure
 from .units import Length, Weight
-
-# Support ratios arrive as floats from the public API but must never decide feasibility
-# in floating point. They are converted once to a scaled integer and every comparison
-# below is exact. See docs/UNITS-AND-NUMERICS.md.
-SUPPORT_SCALE = 1_000_000
-
-
-def scaled_ratio(ratio: float) -> int:
-    return int(ratio * SUPPORT_SCALE + 0.5)
-
-
-def required_area(base_area: int, scaled: int) -> int:
-    """Exact floor(base_area * scaled / SUPPORT_SCALE) without an overflowing product."""
-    whole, remainder = divmod(base_area, SUPPORT_SCALE)
-    return whole * scaled + (remainder * scaled) // SUPPORT_SCALE
-
-
-def reserved_volume(container: Container) -> int:
-    """Volume set aside for packing material, exact even for a metre-scale container.
-
-    Not floating-point `ratio * volume`: that is exactly the double-precision loss
-    this codebase's fixed-point design exists to avoid for a feasibility number.
-    """
-    return required_area(container.inner_dimensions.volume, scaled_ratio(container.void_fill_reserve_ratio))
-
 
 def usable_volume(container: Container) -> int:
     return container.inner_dimensions.volume - reserved_volume(container)
@@ -151,26 +128,6 @@ class ProvenRejection(Protocol):
     def proves_unplaceable(
         self, item: ItemInstance, containers: Sequence[Container]
     ) -> tuple[str, str] | None: ...
-
-
-@dataclass(frozen=True, slots=True)
-class LoadUnit:
-    """The only facts load propagation needs about a box, real or hypothetical."""
-    box: AxisAlignedBox
-    weight_ticks: int
-    max_top_load_ticks: int | None
-    max_stacked_items: int | None
-    label: str
-    nesting_item_id: str | None = None
-    nesting_height_ticks: int | None = None
-    # Set only for a `compressible` item. Load propagation already computes the
-    # cumulative mass above every unit, which is exactly the numerator the pressure model
-    # needs, so the crush check rides the graph that is built anyway rather than a second one.
-    compression_ratio_ppm: int | None = None
-    max_compression_pressure_kpa: int | None = None
-    # The item's own footprint, which the load presses on; `box` is its envelope, grown by the
-    # clearance, and it carries the support graph.
-    footprint_ticks2: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -468,23 +425,6 @@ def stacking_refusal(lower: Item, upper_group: str | None) -> str | None:
     if lower.accepts_stacking_groups and upper_group not in lower.accepts_stacking_groups:
         return "stacking_group_incompatible"
     return None
-
-
-def load_units(placements: Sequence[Placement], extra: LoadUnit | None = None) -> tuple[LoadUnit, ...]:
-    units = [
-        LoadUnit(p.envelope_box, p.instance.weight.ticks,
-                 None if p.instance.item.max_top_load is None else p.instance.item.max_top_load.ticks,
-                 p.instance.item.max_stacked_items,
-                 p.instance.id,
-                 None if p.instance.item.nesting_height is None else p.instance.item.id,
-                 None if p.instance.item.nesting_height is None else p.instance.item.nesting_height.ticks,
-                 p.instance.item.compression_ratio_ppm,
-                 p.instance.item.max_compression_pressure_kpa,
-                 p.dimensions.length.ticks * p.dimensions.width.ticks)
-        for p in placements
-    ]
-    if extra is not None: units.append(extra)
-    return tuple(units)
 
 
 def top_loads(units: Sequence[LoadUnit], graph: LoadSupportGraph | None = None) -> list[int]:

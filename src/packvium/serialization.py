@@ -8,6 +8,7 @@ from dataclasses import replace
 from .config import PackingConfig, SolverProfile
 from .effort import EffortBudget
 from .compression import ratio_to_ppm
+from .flat_bag import FLAT
 from .geometry import AxisAlignedBox, Dimensions, Point, Rotation, ShapeType
 from .models import Axle, Container, FixedPlacement, Item, Obstacle, RateTable
 from .made_to_measure import MadeToMeasure
@@ -33,12 +34,15 @@ def _axles(raw: list | None, unit: str) -> tuple[Axle, Axle] | None:
 
 def _effort_budget(raw: dict | None) -> EffortBudget | None:
     if raw is None: return None
-    return EffortBudget(
-        max_candidates_evaluated=raw.get("max_candidates_evaluated"),
-        max_placement_attempts=raw.get("max_placement_attempts"),
-        max_search_nodes=raw.get("max_search_nodes"),
-        max_restarts=raw.get("max_restarts"),
-    )
+    return EffortBudget(**{name: _admitted_integer(raw.get(name)) for name in (
+        "max_candidates_evaluated", "max_placement_attempts", "max_search_nodes", "max_restarts")})
+
+
+def _admitted_integer(value: Any) -> Any:
+    """An admitted JSON integer as an `int`: admission reads `1.0` as `1`, as JavaScript must,
+    so the value has to reach the solver as one too. Anything else is passed on unchanged."""
+    number = json_integer(value)
+    return value if number is None else number
 
 
 def _hull_vertices(raw, unit: str) -> "tuple[tuple[int, int, int], ...] | None":
@@ -168,14 +172,16 @@ def _container(raw: dict, unit: str, measures: Optional[ParsedMeasures] = None) 
         deformable_boundary=None if raw.get("deformable_boundary") is None else raw["deformable_boundary"]["kind"],
         made_to_measure=_made_to_measure(raw.get("made_to_measure"), unit, measures),
         pallet_overhang_limit=_pallet_overhang_limit(raw.get("pallet_overhang_limit"), unit, measures),
-        side_gusset_depth=_side_gusset_depth(raw.get("deformable_boundary"), unit, measures),
+        side_gusset_depth=_gusset_depth(raw.get("deformable_boundary"), "side_gusset_depth", unit, measures),
+        bottom_gusset_depth=_gusset_depth(raw.get("deformable_boundary"), "bottom_gusset_depth", unit, measures),
+        bag_orientation=(raw.get("deformable_boundary") or {}).get("orientation") or FLAT,
     )
 
 
-def _side_gusset_depth(raw: dict | None, unit: str, measures: ParsedMeasures) -> Length | None:
-    if raw is None or raw.get("side_gusset_depth") is None:
+def _gusset_depth(raw: dict | None, name: str, unit: str, measures: ParsedMeasures) -> Length | None:
+    if raw is None or raw.get(name) is None:
         return None
-    return measures.read(Length, raw["side_gusset_depth"], unit)
+    return measures.read(Length, raw[name], unit)
 
 
 def _pallet_overhang_limit(raw: dict | None, unit: str, measures: ParsedMeasures) -> OverhangLimit | None:

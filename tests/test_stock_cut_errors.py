@@ -54,3 +54,23 @@ def test_stock_costs_keep_exact_integers_and_null_defaults(cost):
     request["containers"][0]["cost_minor"] = cost
     request["fixed_placements"] = [{"container_type": "machine"}]
     assert stock_cut_boxes(request, artifact, 1)["containers"][1]["cost_minor"] == (0 if cost is None else cost)
+
+
+def test_a_cut_box_priced_past_the_exact_integer_ceiling_is_refused_not_rounded():
+    sides = {"length": "10", "width": "10", "height": "10"}
+    request = {"items": [{"id": "cube", "dimensions": sides}], "containers": [
+        {"id": "machine", "inner_dimensions": sides,
+         "made_to_measure": {"minimum": sides, "increment": sides, "cost_per_square_metre_minor": 9007199254740991}}]}
+    artifact = build_operational_artifact(request, pack_from_dict(request))
+    request["fixed_placements"] = [{"container_type": "machine"}]
+    # 600 mm^2 of surface is far below a square metre, so the price stays inside the ceiling.
+    assert stock_cut_boxes(request, artifact, 1)["containers"][1]["cost_minor"] <= 9007199254740991
+    # The same rate on a cut box of 2000 mm per side is 24 m^2 and passes it.
+    cut = copy.deepcopy(artifact)
+    for axis in ("length", "width", "height"):
+        cut["geometry"]["containers"][0]["inner_dimensions"][axis] = str(2000 * 16000)
+    with pytest.raises(PlanRevisionError) as refusal:
+        stock_cut_boxes(request, cut, 1)
+    assert (refusal.value.code, str(refusal.value)) == (
+        "invalid_revision",
+        "a made-to-measure container's cost_per_square_metre_minor prices the largest box above 9007199254740991")

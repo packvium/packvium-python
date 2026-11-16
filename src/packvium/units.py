@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from ._compat import dataclass
 from ._request_error import refused, refused_type
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from enum import Enum
 from fractions import Fraction
 import re
@@ -30,26 +30,50 @@ def _fraction(value: int | str | Decimal | Fraction) -> Fraction:
     if isinstance(value, Decimal):
         return Fraction(value)
     text = str(value).strip().replace("\u00a0", " ")
-    mixed = re.fullmatch(r"([+-]?\d+)\s+(\d+)\s*/\s*(\d+)", text)
+    negative = text.startswith("-")
+    mixed = re.fullmatch(r"[+-]?([0-9]+)\s+([0-9]+)\s*/\s*([0-9]+)", text, re.ASCII)
     if mixed:
-        whole, numerator, denominator = map(int, mixed.groups())
+        whole, numerator, denominator = map(_digits, mixed.groups())
         # The sign comes from the written text, not from the value of the whole part, so
         # "-0 1/2" is minus one half rather than plus one half.
-        magnitude = abs(whole) * denominator + numerator
-        return Fraction(-magnitude if text.startswith("-") else magnitude, denominator)
-    simple = re.fullmatch(r"([+-]?\d+)\s*/\s*(\d+)", text)
+        magnitude = whole * denominator + numerator
+        return Fraction(-magnitude if negative else magnitude, denominator)
+    simple = re.fullmatch(r"[+-]?([0-9]+)\s*/\s*([0-9]+)", text, re.ASCII)
     if simple:
-        return Fraction(int(simple.group(1)), int(simple.group(2)))
-    decimal = re.fullmatch(r"[+-]?\d+(?:\.(\d+))?", text)
+        numerator, denominator = map(_digits, simple.groups())
+        return Fraction(-numerator if negative else numerator, denominator)
+    # ASCII digits only: `\d` alone also matches fullwidth and Arabic-Indic digits, which the
+    # other engines refuse. No exponent form (`1e3000000` would cost seconds before any range
+    # check), no underscores, no bare ".5" or "5.".
+    decimal = re.fullmatch(r"[+-]?([0-9]+)(?:\.([0-9]+))?", text, re.ASCII)
+    if decimal is None:
+        raise refused("wrong_type", f"invalid decimal or fraction: {text}")
+    whole, places = decimal.group(1), decimal.group(2) or ""
     # A shared cap, not a Python limitation: PHP cannot hold 10**19 in an integer, and a
     # silently different accepted range between the two is exactly the kind of divergence
     # this library exists to avoid. Eighteen digits is far past what a tick can express.
-    if decimal and decimal.group(1) and len(decimal.group(1)) > 18:
+    if len(places) > 18:
         raise refused("wrong_type", "decimal has more fractional digits than a tick can distinguish")
-    try:
-        return Fraction(Decimal(text))
-    except InvalidOperation as error:
-        raise refused("wrong_type", f"invalid decimal or fraction: {text}") from error
+    scale = 10 ** len(places)
+    magnitude = _digits(whole) * scale + int(places or "0")
+    return Fraction(-magnitude if negative else magnitude, scale)
+
+
+#: Past this many significant digits a measure is far above every admitted maximum (2^53 - 1
+#: ticks is sixteen digits), so its exact value cannot change the verdict.
+_SIGNIFICANT_DIGITS = 64
+
+
+def _digits(text: str) -> int:
+    """ASCII digits as an integer, saturated past `_SIGNIFICANT_DIGITS` significant digits.
+
+    Reading the full number costs time quadratic in its length (a 1 MB weight took 48 s), and
+    `int` refuses past 4300 digits, which counted leading zeros too. O(len(text)).
+    """
+    significant = text.lstrip("0")
+    if len(significant) > _SIGNIFICANT_DIGITS:
+        return 10 ** _SIGNIFICANT_DIGITS
+    return int(significant or "0")
 
 
 def _unit_key(unit: object) -> str | None:

@@ -41,6 +41,10 @@ these exact objects. See docs/COMMERCE-API.md for the wrapper contract built on 
 from __future__ import annotations
 
 from .._compat import dataclass
+from .._canonical_json import MAX_EXACT_MAGNITUDE
+from .errors import CommerceInputError
+from dataclasses import fields
+from types import MappingProxyType
 from typing import Mapping, Optional
 
 
@@ -109,6 +113,9 @@ class AccessorialCharge:
         return _ceil_div(base_charge_minor * self.permille_of_base, 1000)
 
 
+_TARIFF_MAPPINGS = ("cost_per_dimensional_kg_minor", "accessorials")
+
+
 @dataclass(frozen=True, slots=True)
 class Tariff:
     """One immutable, numbered version of one `(carrier_id, service_id)` pair's rate
@@ -126,6 +133,7 @@ class Tariff:
     accessorials: Mapping[str, AccessorialCharge]
 
     def __post_init__(self) -> None:
+        self._read_only_copy_of_mappings()
         if not self.carrier_id:
             raise ValueError("carrier_id is required")
         if not self.service_id:
@@ -145,6 +153,23 @@ class Tariff:
         mismatched = [key for key, value in self.accessorials.items() if key != value.accessorial_id]
         if mismatched:
             raise ValueError(f"accessorials dict key must match its own accessorial_id: {mismatched}")
+
+    def _read_only_copy_of_mappings(self) -> None:
+        # Published history must replay identically: a read-only copy, so neither the caller's
+        # dict nor the tariff the registry hands back can change a pinned version's rates.
+        for name in _TARIFF_MAPPINGS:
+            object.__setattr__(self, name, MappingProxyType(dict(getattr(self, name))))
+
+    def __getstate__(self):
+        # A mappingproxy cannot be pickled; the read-only view is rebuilt on restore.
+        return [dict(value) if isinstance(value, MappingProxyType) else value
+                for value in (getattr(self, field.name) for field in fields(self))]
+
+    def __setstate__(self, state):
+        # Also accept the dictionary state produced by older non-slotted runtimes.
+        for index, field in enumerate(fields(self)):
+            object.__setattr__(self, field.name, state[field.name] if isinstance(state, dict) else state[index])
+        self._read_only_copy_of_mappings()
 
 
 # ---------------------------------------------------------------------------- breakdown
@@ -194,6 +219,15 @@ class RatingRequest:
             raise ValueError("requested accessorial ids must be unique")
 
 
+def _refuse_unrepresentable(*amounts: int) -> None:
+    """M2: a quote reports exact integers, so the first amount, in reporting order, that a
+    double could not hold exactly refuses the whole quote. O(accessorials)."""
+    for amount in amounts:
+        if amount > MAX_EXACT_MAGNITUDE:
+            raise CommerceInputError(
+                f"quote amount {amount} is above {MAX_EXACT_MAGNITUDE} and cannot be represented exactly")
+
+
 def rate_tariff(tariff: Tariff, request: RatingRequest) -> RateBreakdown:
     """Rate a request against one already-resolved immutable tariff version."""
     if request.zone not in tariff.cost_per_dimensional_kg_minor:
@@ -229,6 +263,11 @@ def rate_tariff(tariff: Tariff, request: RatingRequest) -> RateBreakdown:
     )
     total_minor = base_charge_minor + fuel_surcharge_minor + sum(
         amount for _, amount in accessorial_charges
+    )
+
+    _refuse_unrepresentable(
+        dimensional_weight_g, billed_weight_g, base_charge_minor, fuel_surcharge_minor,
+        *(amount for _, amount in accessorial_charges), total_minor,
     )
 
     return RateBreakdown(

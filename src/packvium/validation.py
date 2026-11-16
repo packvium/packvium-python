@@ -7,7 +7,7 @@ from .constraints import (CompatibilityConstraint, ConstraintContext, LoadSuppor
                           SupportConstraint, TagCountConstraint, load_units,
                           crushed, non_stackable_failure, overloaded, stack_density_exceeded,
                           stack_limit_exceeded, usable_volume)
-from .flat_bag import extent_of, girth_admits
+from .flat_bag import extent_of
 from .geometry import AxisAlignedBox, Point
 from . import made_to_measure
 from .models import (Container, PackedContainer, PackingRequest, UnpackedItem, is_stack_sensitive,
@@ -256,10 +256,12 @@ class IndependentSolutionValidator:
 
     @staticmethod
     def _bag_admits(packed: PackedContainer) -> bool:
-        """The girth rule over the envelopes alone, widened by a side gusset (1.10);
-        the frame is checked above."""
-        a, b, c = extent_of((box.x2, box.y2, box.z2) for box in (p.envelope_box for p in packed.placements))
-        return girth_admits(packed.container.inner_dimensions, a, b, c, packed.container.side_gusset_ticks)
+        """The girth rule over the envelopes alone, widened by a side gusset (1.10)
+        and lengthened by a bottom one, flat or standing; the frame is checked above."""
+        girth = packed.container.girth
+        assert girth is not None
+        return girth.admits(extent_of((box.x2, box.y2, box.z2)
+                                      for box in (p.envelope_box for p in packed.placements)))
 
     @staticmethod
     def _unloading_order_violation(packed: PackedContainer) -> "ValidationIssue | None":

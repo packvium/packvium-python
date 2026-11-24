@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from .._canonical_json import MAX_EXACT_MAGNITUDE
 from .catalog import (
     AmbiguousCatalogReferenceError,
     CatalogVersionNotFoundError,
@@ -67,7 +68,7 @@ def _request(value: Any) -> Mapping[str, Any]:
 
 
 def _integer(value: Any, path: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
+    if isinstance(value, bool) or not isinstance(value, int) or abs(value) > MAX_EXACT_MAGNITUDE:
         _fail(path, "expected an exact integer")
     return value
 

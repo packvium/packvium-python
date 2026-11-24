@@ -549,7 +549,10 @@ def test_a_score_below_its_bound_withholds_the_statement_rather_than_publishing_
 
 
 @pytest.mark.parametrize('cheap_cost', [0, 1])
-def test_a_gap_past_the_portable_ceiling_withholds_only_the_statement(cheap_cost):
+def test_a_cost_sum_past_the_portable_ceiling_is_refused_before_any_gap_is_stated(cheap_cost):
+    """A score past 2^53 - 1 used to reach the gap statement and have only the gap withheld.
+    refuses the worst-case summed cost at admission, so no admitted request has a gap
+    past the ceiling; the inclusive ceiling itself is pinned on `bounds.statement` below."""
     request = {
         'items': [{'id': 'i', 'quantity': 2, 'dimensions': dict.fromkeys(('length', 'width', 'height'), '10')}],
         'containers': [
@@ -559,16 +562,9 @@ def test_a_gap_past_the_portable_ceiling_withholds_only_the_statement(cheap_cost
              'cost_minor': bounds.MAX_BOUND_VALUE, 'max_items': 1},
         ],
     }
-    result = packvium.pack_from_dict(request)
-    assert result['score'][2] == 2 * bounds.MAX_BOUND_VALUE
-    assert result['optimality'] == {'code': 'not_proven'}
-    assert packvium.validate(request, result) == []
-    result['optimality'].update(lower_bound=[0, 2, 2 * cheap_cost], gap_key=2,
-                                absolute_gap=result['score'][2] - 2 * cheap_cost)
-    if cheap_cost:
-        result['optimality']['relative_gap'] = {
-            'numerator': result['optimality']['absolute_gap'], 'denominator': 2 * cheap_cost}
-    assert 'optimality_gap_mismatch' in [issue.code for issue in packvium.validate(request, result)]
+    with pytest.raises(packvium.InvalidRequestError) as caught:
+        packvium.pack_from_dict(request)
+    assert (caught.value.reason, caught.value.field) == ('above_maximum', '/containers')
 
 
 @pytest.mark.parametrize('least', [0, 1])

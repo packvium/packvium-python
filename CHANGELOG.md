@@ -4,6 +4,27 @@ What changed in `packvium` on PyPI, release by release. The format follows
 [Keep a Changelog](https://keepachangelog.com/1.1.0/) and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.12.0]
+
+The money ceiling covers sums, one order for unplaced items, and faster hull and unloading
+checks.
+
+### Changed
+
+- **A request whose dearest openable containers cost more than 9007199254740991 minor units in
+  all,** or whose landed top brackets bill more than that in all, is `invalid_request` /
+  `above_maximum` at `/containers`.
+- **A commerce input integer outside ±(2^53 − 1)** is refused at its path with `expected an
+  exact integer`. 1.11 computed with it exactly.
+- **`unpacked_items` is listed in request order, then by instance number,** in the answer and
+  in every alternative, as in the other engines.
+
+### Performance
+
+- **Hull collision checks reuse each shape pair's separating axes and projections:** 0.211 s →
+  0.078 s CPU on the quality-beam wedge fixture.
+- **`safe_removal_order`, route removal and their validation run in O(n² · d).**
+
 ## [1.11.0]
 
 Bottom gussets and standing pouches, a certified bound for the shipping objectives, one money

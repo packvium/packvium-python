@@ -488,3 +488,20 @@ def test_a_container_without_volume_counts_but_adds_no_unused_or_height_share() 
                                  "container_type": "flat", "placements": [], "used_volume_ticks3": "0"})
     assert [str(issue) for issue in validate(request, result) if issue.code == "score_mismatch"] == [
         "score_mismatch: reported [0, 1, 0, 0, 1000000], recomputed [0, 2, 0, 0, 1000000]"]
+
+
+def test_a_row_toward_one_door_unloads_nearest_first_and_validates():
+    """Three crates due at one stop, in a row toward the only door. Each comes out
+    only once the one nearer the door has, which is the blocker count each removal lowers."""
+    crate = {"quantity": 1, "stop_index": 0, "allowed_rotations": ["LWH"],
+             "dimensions": {"length": "100", "width": "100", "height": "100"}}
+    request = {
+        "configuration": {"solver_profile": "fast", "effort_budget": {
+            "max_candidates_evaluated": 100000, "max_placement_attempts": 100000, "max_search_nodes": 100000}},
+        "items": [{"id": name, **crate} for name in ("a", "b", "c")],
+        "containers": [{"id": "van", "access_directions": ["+x"],
+                        "inner_dimensions": {"length": "300", "width": "100", "height": "100"}}],
+    }
+    result = pack_from_dict(request)
+    assert len(result["containers"][0]["placements"]) == 3
+    assert validate(request, result) == []

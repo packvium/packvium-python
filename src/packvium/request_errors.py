@@ -24,7 +24,7 @@ from typing import Any, Callable, Iterable, Mapping, Optional, Sequence, Set, Tu
 from ._canonical_json import MAX_EXACT_MAGNITUDE, json_integer, json_spelling
 from ._request_error import InvalidRequestError
 from .flat_bag import BAG_ORIENTATIONS, DEFORMABLE_BOUNDARY_KINDS, GUSSETED_BAG, STANDING
-from .units import LENGTH_UNIT_CODES, WEIGHT_UNIT_CODES, Length, ParsedMeasures, Weight
+from .units import LENGTH_UNIT_CODES, WEIGHT_UNIT_CODES, Length, ParsedMeasures, Weight, _unit_key
 from .made_to_measure import box_cost_minor_for
 from .orientations import CODES, UPRIGHT_CODES, SIGNED_CODE_NEEDS_A_HULL, refusal_reason, vocabulary
 from .bounds import MAX_BOUND_SUM
@@ -134,7 +134,7 @@ def _measure(value: Any, field: str, kind: Type[Length] | Type[Weight], unit: st
         if "value" not in value:
             raise InvalidRequestError("wrong_type", field, "must be a measure")
         stated = value.get("unit", unit)
-        if not isinstance(stated, str) or stated.lower().strip() not in kind._MULTIPLIERS:
+        if _unit_key(stated) not in kind._MULTIPLIERS:
             raise InvalidRequestError("invalid_unit", field, f"has an unknown unit {json_spelling(stated)}")
     amount = value["value"] if isinstance(value, Mapping) else value
     if kind is Length and _whole_beyond_exact(amount):
@@ -210,6 +210,7 @@ def check_request(data: Any) -> ParsedMeasures:
         _check_container(raw, pointer("containers", index), unit, measures, currency)
     _require_unique_ids(containers, "containers")
     _total_weight(items, containers, measures)
+    _total_money(items, containers, unit, measures)
     return measures
 
 
@@ -222,7 +223,7 @@ def _check_units(raw: Any) -> str:
     length = units.get("length")
     if length is None:
         return "mm"
-    if not isinstance(length, str) or length.lower().strip() not in Length._MULTIPLIERS:
+    if _unit_key(length) not in Length._MULTIPLIERS:
         raise InvalidRequestError("invalid_unit", "/units/length",
                                   f"has an unknown unit {json_spelling(length)}")
     return length
@@ -558,6 +559,24 @@ def _total_weight(items: list, containers: list, measures: ParsedMeasures) -> No
                        (ticks(container, "tare_weight") for container in containers))
 
 
+def _total_money(items: list, containers: list, unit: str, measures: ParsedMeasures) -> None:
+    def money(container: Mapping[str, Any]) -> Tuple[Optional[int], int, int]:
+        fee = json_integer(container.get("cost_minor") or 0)
+        machine = container.get("made_to_measure")
+        cost = fee if machine is None else box_cost_minor_for(
+            json_integer(machine.get("cost_per_square_metre_minor") or 0), fee,
+            _ticks(container["inner_dimensions"], unit, measures))
+        table = container.get("rate_table") or {}
+        landed = top_bracket_landed_minor(
+            [json_integer(price) for price in table.get("prices_minor") or ()],
+            json_integer(table.get("minimum_charge_minor") or 0),
+            json_integer(table.get("fuel_surcharge_permille") or 0))
+        quantity = container.get("quantity")
+        return (None if quantity is None else json_integer(quantity), cost, landed)
+    total_money_minor(sum(json_integer(item.get("quantity", 1)) for item in items),
+                      (money(container) for container in containers))
+
+
 def _enclosure(sides: Tuple[int, int, int], where: str) -> None:
     length, width, height = sides
     if length * width * height > MAX_VOLUME_TICKS3:
@@ -606,13 +625,43 @@ def top_bracket_landed(prices: Sequence[int], minimum_charge: int, surcharge_per
     `MAX_EXACT_MAGNITUDE`. The same arithmetic as `RateTable.charge_minor_or_none`, so no
     bracket the table can bill passes it. A table with no prices is left to the other rules.
     Shared with `request_objects`. O(prices)."""
-    if not prices:
-        return
-    base = max(max(prices), minimum_charge)
-    if base + -(-base * surcharge_permille // 1000) > MAX_EXACT_MAGNITUDE:
+    if top_bracket_landed_minor(prices, minimum_charge, surcharge_permille) > MAX_EXACT_MAGNITUDE:
         raise InvalidRequestError(
             "above_maximum", where,
             f"must price its top bracket at most {MAX_EXACT_MAGNITUDE} minor units with the fuel surcharge")
+
+
+def top_bracket_landed_minor(prices: Sequence[int], minimum_charge: int, surcharge_permille: int) -> int:
+    """The most one container on this table can be billed, fuel surcharge included; 0 for a
+    table with no prices. O(prices)."""
+    if not prices:
+        return 0
+    base = max(max(prices), minimum_charge)
+    return base + -(-base * surcharge_permille // 1000)
+
+
+def total_money_minor(item_count: int, containers: Iterable[Tuple[Optional[int], int, int]]) -> None:
+    """M3: the most money the containers `item_count` items can open could sum to in a
+    packing score, against `MAX_EXACT_MAGNITUDE` -- container cost first, then the landed
+    charge. Each container is `(quantity or None, dearest cost_minor, dearest landed
+    charge)`. An opened container holds at least one item, so at most `item_count` open;
+    the dearest types fill that count first, up to their quantity. The bound reads only the
+    request, so whether a request is refused never depends on which packing an engine found.
+    Shared with `request_objects`. O(c log c) for c containers."""
+    stock = list(containers)
+    for position, message in ((1, "must cost"), (2, "must bill")):
+        remaining, total = item_count, 0
+        for quantity, *money in sorted(stock, key=lambda container: -container[position]):
+            if remaining == 0:
+                break
+            opened = remaining if quantity is None else min(quantity, remaining)
+            total += opened * money[position - 1]
+            remaining -= opened
+        if total > MAX_EXACT_MAGNITUDE:
+            raise InvalidRequestError(
+                "above_maximum", "/containers",
+                f"{message} at most {MAX_EXACT_MAGNITUDE} minor units in all across the containers "
+                f"the items can open")
 
 
 def currency_code(value: Any, field: str) -> None:

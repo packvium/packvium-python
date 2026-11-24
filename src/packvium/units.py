@@ -9,6 +9,20 @@ import re
 from typing import Any, Optional, Tuple, Type, TypeVar
 
 
+#: The whitespace of `\s` over ASCII text (space, tab, newline, return, form feed, vertical tab).
+_ASCII_SPACE = " \t\n\r\f\v"
+_LENGTH_SUFFIX_RE = re.compile(
+    r"(.+?)\s*(mm|cm|m|in|inch|inches|ft|ticks?)", re.IGNORECASE | re.ASCII
+)
+_WEIGHT_SUFFIX_RE = re.compile(
+    r"(.+?)\s*(mg|kg|g|oz|lbs?|ticks?)", re.IGNORECASE | re.ASCII
+)
+
+
+def _strip_ascii(text: str) -> str:
+    return text.strip(_ASCII_SPACE)
+
+
 class Rounding(str, Enum):
     FLOOR = "floor"
     CEIL = "ceil"
@@ -29,7 +43,7 @@ def _fraction(value: int | str | Decimal | Fraction) -> Fraction:
         return Fraction(value, 1)
     if isinstance(value, Decimal):
         return Fraction(value)
-    text = str(value).strip().replace("\u00a0", " ")
+    text = _strip_ascii(str(value)).replace("\u00a0", " ")
     negative = text.startswith("-")
     mixed = re.fullmatch(r"[+-]?([0-9]+)\s+([0-9]+)\s*/\s*([0-9]+)", text, re.ASCII)
     if mixed:
@@ -79,7 +93,7 @@ def _digits(text: str) -> int:
 def _unit_key(unit: object) -> str | None:
     """A unit code as the tables key it, or None for a value that is no code at all: `None` or
     a number is an unknown unit, as the JSON path refuses it, not an AttributeError."""
-    return unit.lower().strip() if isinstance(unit, str) else None
+    return _strip_ascii(unit).lower() if isinstance(unit, str) else None
 
 
 def _non_negative(ticks: int, kind: str) -> int:
@@ -167,9 +181,9 @@ class Length:
                 raise refused_type("float length input is intentionally rejected; use a decimal string")
             value = int(value)
         if isinstance(value, str):
-            match = re.fullmatch(r"(.+?)\s*(mm|cm|m|in|inch|inches|ft|ticks?)", value.strip(), re.I)
+            match = _LENGTH_SUFFIX_RE.fullmatch(_strip_ascii(value))
             if match:
-                return cls.of(match.group(1).strip(), match.group(2), rounding)
+                return cls.of(_strip_ascii(match.group(1)), match.group(2), rounding)
         return cls.of(value, default_unit, rounding)
 
     def as_fraction(self, unit: str = "mm") -> Fraction:
@@ -231,9 +245,9 @@ class Weight:
                 raise refused_type("float weight input is intentionally rejected; use a decimal string")
             value = int(value)
         if isinstance(value, str):
-            match = re.fullmatch(r"(.+?)\s*(mg|kg|g|oz|lbs?|ticks?)", value.strip(), re.I)
+            match = _WEIGHT_SUFFIX_RE.fullmatch(_strip_ascii(value))
             if match:
-                return cls.of(match.group(1).strip(), match.group(2), rounding)
+                return cls.of(_strip_ascii(match.group(1)), match.group(2), rounding)
         return cls.of(value, default_unit, rounding)
 
     def decimal(self, unit: str = "g", places: int = 8) -> str:
@@ -305,5 +319,5 @@ def output_length_unit(request_unit: str) -> str:
     The request's own `units.length`, spelt as the schema's output code: case and surrounding
     space are ignored and a spelt-out name folds to its code (`"Inches"` is `in`). A unit no
     output code names -- the internal `tick` -- gives `mm`, the default of both blocks."""
-    multiplier = Length._MULTIPLIERS.get(request_unit.lower().strip())
+    multiplier = Length._MULTIPLIERS.get(_unit_key(request_unit))
     return next((code for code in LENGTH_UNIT_CODES if Length._MULTIPLIERS[code] == multiplier), "mm")

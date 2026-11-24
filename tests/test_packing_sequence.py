@@ -34,6 +34,7 @@ import pytest
 
 from packvium import (AxisAlignedBox, Container, Dimensions, Item, Length, Placement, Point,
                          Rotation)
+from packvium.geometry import ALL_DIRECTIONS
 from packvium.packing_sequence import (
     InvalidDirectionError,
     LoadingDependencyGraph,
@@ -945,3 +946,107 @@ def test_isolated_floor_step_among_many_floor_boxes_catches_exact_density_offend
     assert excinfo.value.step == 27
     assert "stack_density_exceeded" in excinfo.value.reason
 
+
+
+# -------------------------------------------------- removal search counts blockers
+
+
+def _rescanning_removal_order(boxes, container, directions):
+    """The search before: restart at index 0 after every removal and test each box
+    again. Kept as the oracle the counted search must equal, as Rust keeps its own."""
+    from packvium.packing_sequence import _clear_direction
+
+    graph = UnloadingDependencyGraph.build(boxes)
+    present = frozenset(range(len(boxes)))
+    order = []
+    while present:
+        chosen = next((index for index in range(len(boxes))
+                       if index in present and not (graph.depends_on[index] & present)
+                       and _clear_direction(index, boxes[index], boxes, present, container,
+                                            directions) is not None), None)
+        if chosen is None:
+            raise SequenceError(present)
+        order.append(chosen)
+        present = present - {chosen}
+    replay_removal_order(boxes, container, order, directions)
+    return order
+
+
+def _outcome(search, *args):
+    try:
+        return search(*args)
+    except SequenceError as error:
+        return ("stuck", sorted(error.stuck))
+    except SequenceReplayError as error:
+        return ("replay", str(error))
+
+
+def test_the_counted_removal_search_answers_what_rescanning_would_on_mixed_scenes():
+    rng = random.Random(0x2545F491)
+    direction_sets = [("+x",), ("+x", "+y"), ("-z", "+x"), ALL_DIRECTIONS, ()]
+    container = Dimensions.mm(60, 50, 40)
+    for round_ in range(400):
+        boxes = [box(rng.randrange(5) * 10, rng.randrange(4) * 10, rng.randrange(3) * 10,
+                     10 * (1 + rng.randrange(2)), 10 * (1 + rng.randrange(2)), 10)
+                 for _ in range(1 + rng.randrange(14))]
+        directions = direction_sets[round_ % len(direction_sets)]
+        assert (_outcome(safe_removal_order, boxes, container, directions)
+                == _outcome(_rescanning_removal_order, boxes, container, directions)), round_
+
+
+def test_a_row_blocked_all_the_way_back_costs_quadratic_sweeps(monkeypatch):
+    """Sixty boxes in a row with one door: each removal unblocks only its neighbour. The
+    rescanning search tested every remaining box against the whole row on every step,
+    O(n^3); counted, each pair is swept a bounded number of times."""
+    import packvium.packing_sequence as sequence
+
+    tests = [0]
+    real = sequence.sweep_intersects
+
+    def counting(sweep, other):
+        tests[0] += 1
+        return real(sweep, other)
+
+    monkeypatch.setattr(sequence, "sweep_intersects", counting)
+    boxes = [box(i * 10, 0, 0, 10, 10, 10) for i in range(60)]
+    order = safe_removal_order(boxes, Dimensions.mm(600, 10, 10), ("+x",))
+    assert order == list(range(59, -1, -1))
+    assert tests[0] <= 6 * 60 * 60
+
+
+def _rescanning_route_removal_order(boxes, stops, container, directions):
+    """`safe_route_removal_order` before, the oracle for the counted search."""
+    from packvium.packing_sequence import _clear_direction
+
+    graph = UnloadingDependencyGraph.build(boxes)
+    remaining = frozenset(range(len(boxes)))
+    order = []
+    for stop in sorted({stop for stop in stops if stop is not None}):
+        due = frozenset(index for index in remaining if stops[index] == stop)
+        while due:
+            chosen = next((index for index in range(len(boxes))
+                           if index in due and not (graph.depends_on[index] & remaining)
+                           and _clear_direction(index, boxes[index], boxes, remaining, container,
+                                                directions) is not None), None)
+            if chosen is None:
+                raise RouteSequenceError(stop, due)
+            order.append(chosen)
+            remaining, due = remaining - {chosen}, due - {chosen}
+    return order
+
+
+def test_the_counted_route_search_answers_what_rescanning_would():
+    rng = random.Random(0x1442695)
+    container = Dimensions.mm(60, 50, 40)
+    for round_ in range(300):
+        boxes = [box(rng.randrange(5) * 10, rng.randrange(4) * 10, rng.randrange(3) * 10, 10, 10, 10)
+                 for _ in range(1 + rng.randrange(12))]
+        stops = [rng.choice((None, 0, 1, 2)) for _ in boxes]
+        directions = (("+x",), ("+x", "-y"), ALL_DIRECTIONS)[round_ % 3]
+        outcomes = []
+        for search in (safe_route_removal_order, _rescanning_route_removal_order):
+            try:
+                outcomes.append(search(boxes, stops, container, directions))
+            except RouteSequenceError as error:
+                outcomes.append((error.stop, sorted(error.stuck)))
+        assert outcomes[0] == outcomes[1], round_

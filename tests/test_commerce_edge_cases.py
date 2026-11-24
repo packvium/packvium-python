@@ -555,11 +555,12 @@ class TestQuoteAmountsAreHeldToTheExactIntegerCeiling:
         assert result["quote"]["base_charge_minor"] == CEILING
         assert result["quote"]["total_minor"] == CEILING
 
-    def test_a_base_charge_one_above_the_ceiling_is_refused(self):
+    def test_a_rate_one_above_the_ceiling_is_refused_at_its_path(self):
+        # An input past 2^53 - 1 is refused where it is written, as every engine does.
         with pytest.raises(CommerceInputError) as caught:
             ceiling_quote(rate_per_kg=CEILING + 1)
         assert str(caught.value) == (
-            f"quote amount {CEILING + 1} is above {CEILING} and cannot be represented exactly")
+            "document.tariffs[0].versions[0].cost_per_dimensional_kg_minor['zone-a']: expected an exact integer")
 
     def test_a_fuel_surcharge_above_the_ceiling_is_refused_with_its_own_value(self):
         with pytest.raises(CommerceInputError) as caught:
@@ -567,12 +568,12 @@ class TestQuoteAmountsAreHeldToTheExactIntegerCeiling:
         assert str(caught.value) == (
             f"quote amount {18 * 10**15} is above {CEILING} and cannot be represented exactly")
 
-    def test_an_accessorial_above_the_ceiling_is_refused_with_its_own_value(self):
+    def test_an_accessorial_above_the_ceiling_is_refused_at_its_path(self):
         with pytest.raises(CommerceInputError) as caught:
             ceiling_quote(accessorials=[{"accessorial_id": "liftgate", "flat_charge_minor": CEILING + 1}],
                           requested=["liftgate"])
         assert str(caught.value) == (
-            f"quote amount {CEILING + 1} is above {CEILING} and cannot be represented exactly")
+            "document.tariffs[0].versions[0].accessorials[0].flat_charge_minor: expected an exact integer")
 
     def test_an_accessorial_exactly_at_the_ceiling_is_answered(self):
         result = ceiling_quote(rate_per_kg=0, accessorials=[
@@ -585,7 +586,7 @@ class TestQuoteAmountsAreHeldToTheExactIntegerCeiling:
         assert str(caught.value) == (
             f"quote amount {10**16} is above {CEILING} and cannot be represented exactly")
 
-    def test_the_dimensional_weight_is_checked_before_the_charges(self):
+    def test_the_document_is_checked_before_the_request(self):
         with pytest.raises(CommerceInputError) as caught:
             ceiling_quote(rate_per_kg=CEILING + 1, volume_mm3=(CEILING + 1) * 5000)
-        assert str(caught.value).startswith(f"quote amount {CEILING + 1} is above")
+        assert str(caught.value).startswith("document.tariffs[0].versions[0].cost_per_dimensional_kg_minor")

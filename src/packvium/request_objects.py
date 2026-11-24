@@ -26,7 +26,8 @@ from .models import Container, FixedPlacement, Item, RateTable
 from .request_errors import (BAG_EXCLUSIONS, InvalidRequestError, _integer, _one_of,
                              _ratio, _set_beside_a_bag, _stacking_group_name, box_ticks,
                              currency_code, length_ticks, pallet_frame, pointer, pointer_join,
-                             rate_table_currency, top_bracket_landed, total_weight_ticks, weight_ticks)
+                             rate_table_currency, top_bracket_landed, top_bracket_landed_minor,
+                             total_money_minor, total_weight_ticks, weight_ticks)
 
 #: (JSON name, PackingConfig attribute, floor), in `check_request`'s order.
 _CONFIGURATION_INTEGERS = (("time_limit_ms", "time_limit_ms", 1), ("alternatives", "top_k", 1),
@@ -57,10 +58,22 @@ def check_objects(items: Sequence[Item], containers: Sequence[Container], config
     _check_routes_beside_pallets(items, containers)
     total_weight_ticks(((item.weight.ticks, item.quantity) for item in items),
                        (container.tare_weight.ticks for container in containers))
+    total_money_minor(sum(item.quantity for item in items),
+                      (_container_money(container) for container in containers))
     hull_types = frozenset(item.id for item in items if item.shape_type is ShapeType.CONVEX_HULL)
     for index, placement in enumerate(fixed_placements):
         _check_fixed_placement(placement, f"fixed_placements[{index}]", pointer("fixed_placements", index),
                                hull_types)
+
+
+def _container_money(container: Container) -> tuple[Optional[int], int, int]:
+    cost = (container.cost_minor if container.made_to_measure is None
+            else box_cost_minor_for(container.made_to_measure.cost_per_square_metre_minor,
+                                    container.cost_minor, as_triple(container.inner_dimensions)))
+    table = container.rate_table
+    landed = 0 if table is None else top_bracket_landed_minor(
+        table.prices_minor, table.minimum_charge_minor, table.fuel_surcharge_permille)
+    return (container.quantity, cost, landed)
 
 
 def _check_routes_beside_pallets(items: Sequence[Item], containers: Sequence[Container]) -> None:

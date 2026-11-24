@@ -368,6 +368,8 @@ def test_each_request_error_names_its_rule(edit, reason, field, detail):
 def test_the_price_ceiling_admits_the_largest_box_exactly_at_the_limit():
     data = request(inner_dimensions=mm(1000, 1000, 1000), cost_minor=0,
                    made_to_measure={"minimum": mm(1000, 1000, 1000), "increment": mm(1, 1, 1)})
+    # One cube opens one box, so only the per-box ceiling applies, not the summed one.
+    data["items"][0]["quantity"] = 1
     # Six square metres: the largest price whose box stays within 2^53 - 1.
     data["containers"][0]["made_to_measure"]["cost_per_square_metre_minor"] = MAX_EXACT_INTEGER // 6
     pack_from_dict(copy.deepcopy(data))

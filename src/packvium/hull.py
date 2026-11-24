@@ -45,6 +45,7 @@ from __future__ import annotations
 from functools import lru_cache
 from itertools import combinations
 from math import gcd
+from threading import Lock
 from typing import Iterable, Sequence, Tuple
 
 from ._compat import dataclass
@@ -366,6 +367,61 @@ def separating_axes(left: HullShape, right: HullShape) -> Tuple[Axis, ...]:
     return tuple(sorted(axes))
 
 
+#: Ceilings on the pair memo below, in entries and in axes held across all entries. A request
+#: meets at most (distinct hull items x orientations + distinct box sizes) squared ordered
+#: pairs, and a pair of 32-vertex hulls carries at most a few thousand axes, so either bound is
+#: generous for one request; what they stop is a long-lived process accumulating pairs forever.
+#: The same two numbers as the JavaScript fallback's `PAIR_PLAN_ENTRIES` / `PAIR_PLAN_AXES`.
+PAIR_PLAN_ENTRIES = 256
+PAIR_PLAN_AXES = 60_000
+
+#: An ordered pair's separating axes with each shape's projection interval on every one.
+PairPlan = Tuple[Tuple[Axis, ...], Tuple[Tuple[int, int], ...], Tuple[Tuple[int, int], ...]]
+
+_PAIR_PLANS: "dict[Tuple[HullShape, HullShape], PairPlan]" = {}
+_PAIR_PLAN_LOCK = Lock()
+_pair_plan_axes = 0
+
+
+def pair_plan(left: HullShape, right: HullShape) -> PairPlan:
+    """Memoise the ordered pair's axes and local projection intervals.
+
+    All three depend on the two rotated shapes and never on where they stand: a placement
+    only adds `origin . axis` to an interval. Rebuilding them per test made every collision
+    check pay the `O(e_a * e_b)` axis product plus `O(axes * (a + b))` projections -- 6636
+    builds on the quality-beam wedge fixture where 90 distinct pairs exist.
+
+    Keyed by the shapes themselves, whose equality is the whole of what determines the
+    plan, so a box rebuilt per call still hits. Emptied whole when either ceiling would be
+    passed, so the contents depend only on the call sequence; and a hit returns exactly what
+    a rebuild would, so no output can depend on whether it hit.
+    """
+    global _pair_plan_axes
+    key = (left, right)
+    found = _PAIR_PLANS.get(key)
+    if found is not None:
+        return found
+    axes = separating_axes(left, right)
+    plan = (
+        axes,
+        tuple(left.projection(axis) for axis in axes),
+        tuple(right.projection(axis) for axis in axes),
+    )
+    # Build outside the lock. A concurrent miss may already have published this pair.
+    with _PAIR_PLAN_LOCK:
+        found = _PAIR_PLANS.get(key)
+        if found is not None:
+            return found
+        if len(axes) > PAIR_PLAN_AXES:
+            return plan
+        if len(_PAIR_PLANS) >= PAIR_PLAN_ENTRIES or _pair_plan_axes + len(axes) > PAIR_PLAN_AXES:
+            _PAIR_PLANS.clear()
+            _pair_plan_axes = 0
+        _PAIR_PLANS[key] = plan
+        _pair_plan_axes += len(axes)
+    return plan
+
+
 def collide(left: HullShape, left_origin: Vertex, right: HullShape, right_origin: Vertex) -> bool:
     """Do two placed hulls overlap with positive volume?
 
@@ -373,9 +429,10 @@ def collide(left: HullShape, left_origin: Vertex, right: HullShape, right_origin
     with the half-open convention `AxisAlignedBox.intersects` already uses for cuboids, so a
     hull resting exactly on a box is supported rather than colliding with it.
     """
-    for axis in separating_axes(left, right):
-        left_low, left_high = left.projection(axis)
-        right_low, right_high = right.projection(axis)
+    axes, left_spans, right_spans = pair_plan(left, right)
+    for axis, (left_low, left_high), (right_low, right_high) in zip(
+        axes, left_spans, right_spans
+    ):
         left_shift = _dot(left_origin, axis)
         right_shift = _dot(right_origin, axis)
         if (left_high + left_shift <= right_low + right_shift

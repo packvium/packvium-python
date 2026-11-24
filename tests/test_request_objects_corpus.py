@@ -157,10 +157,12 @@ DIFFERENT_ON_PURPOSE: dict[str, str] = {
                                     "holds the exact integer") for name in (
         "item.weight", "item.max_top_load", "container.tare_weight", "container.max_payload",
         "container.max_stack_density", "container.made_to_measure.tare_per_square_metre")},
+    "item-weight-json-number-beyond-i64": ("a JSON number past 2^53 - 1 is a rule of the JSON text; an object "
+                                           "holds the exact integer"),
 }
 
 #: Pinned, so the skip set cannot grow without this line changing too.
-SKIPPED = 108
+SKIPPED = 109
 
 
 @dataclass(frozen=True)

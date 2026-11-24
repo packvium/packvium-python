@@ -91,6 +91,77 @@ def test_a_tetrahedron_misses_a_cube_that_its_bounding_box_overlaps():
     assert collide(tetra, (0, 0, 0), unit, (7, 7, 7)) is False
 
 
+def test_a_shape_pair_builds_its_axes_once_however_often_it_is_tested(monkeypatch):
+    """The axes and local intervals depend on the two shapes, never on where they
+    stand, so every origin after the first reuses them -- and answers what a rebuild would."""
+    import packvium.hull as hull
+
+    builds = []
+    real = hull.separating_axes
+    monkeypatch.setattr(hull, "separating_axes", lambda a, b: builds.append(1) or real(a, b))
+    monkeypatch.setattr(hull, "_PAIR_PLANS", {})
+    tetra, unit = HullShape.of(TETRAHEDRON), cube(4)
+    origins = [(x, y, z) for x in range(0, 12, 3) for y in range(0, 12, 3) for z in range(0, 12, 3)]
+    memoised = [collide(tetra, (0, 0, 0), unit, origin) for origin in origins]
+    assert len(builds) == 1
+    monkeypatch.setattr(hull, "_PAIR_PLANS", {})
+    rebuilt = []
+    for origin in origins:
+        hull._PAIR_PLANS.clear()
+        rebuilt.append(collide(tetra, (0, 0, 0), unit, origin))
+    assert memoised == rebuilt and True in memoised and False in memoised
+
+
+def test_the_pair_memo_empties_whole_at_its_ceiling(monkeypatch):
+    import packvium.hull as hull
+
+    monkeypatch.setattr(hull, "_PAIR_PLANS", {})
+    monkeypatch.setattr(hull, "_pair_plan_axes", 0)
+    monkeypatch.setattr(hull, "PAIR_PLAN_ENTRIES", 2)
+    shapes = [cube(side) for side in (2, 3, 4)]
+    for shape in shapes:
+        hull.pair_plan(shapes[0], shape)
+    assert list(hull._PAIR_PLANS) == [(shapes[0], shapes[2])]
+
+
+def test_a_plan_larger_than_the_axis_budget_is_not_cached(monkeypatch):
+    import packvium.hull as hull
+
+    monkeypatch.setattr(hull, "_PAIR_PLANS", {})
+    monkeypatch.setattr(hull, "_pair_plan_axes", 0)
+    monkeypatch.setattr(hull, "PAIR_PLAN_AXES", 2)
+    shape = cube(4)
+    plan = hull.pair_plan(shape, shape)
+    assert len(plan[0]) == 3
+    assert not hull._PAIR_PLANS
+    assert hull._pair_plan_axes == 0
+
+
+def test_parallel_pair_memo_misses_only_charge_for_one_entry(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    import packvium.hull as hull
+
+    misses = Barrier(2, timeout=10)
+    separating_axes = hull.separating_axes
+
+    def synchronized_axes(left, right):
+        misses.wait()
+        return separating_axes(left, right)
+
+    monkeypatch.setattr(hull, "_PAIR_PLANS", {})
+    monkeypatch.setattr(hull, "_pair_plan_axes", 0)
+    monkeypatch.setattr(hull, "separating_axes", synchronized_axes)
+    left, right = HullShape.of(TETRAHEDRON), cube(4)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(hull.pair_plan, left, right)
+        second = pool.submit(hull.pair_plan, left, right)
+        plan = first.result()
+        assert second.result() == plan
+    assert hull._pair_plan_axes == len(plan[0])
+
+
 def test_collision_does_not_depend_on_argument_order():
     tetra = HullShape.of(TETRAHEDRON)
     unit = cube(6)

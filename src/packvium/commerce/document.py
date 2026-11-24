@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+from .._canonical_json import MAX_EXACT_MAGNITUDE
 from .._compat import dataclass
 from .catalog import (
     CartonMaster,
@@ -63,8 +64,9 @@ def _sequence(value: Any, path: str) -> Sequence[Any]:
 
 def _integer(value: Any, path: str) -> int:
     # `bool` is a subclass of `int`; a boolean where an exact integer belongs is a
-    # caller mistake, not a zero or a one.
-    if isinstance(value, bool) or not isinstance(value, int):
+    # caller mistake, not a zero or a one. Past 2^53 - 1 JavaScript has already rounded
+    # the JSON number, so every implementation holds commerce integers to the safe ceiling.
+    if isinstance(value, bool) or not isinstance(value, int) or abs(value) > MAX_EXACT_MAGNITUDE:
         _fail(path, "expected an exact integer")
     return value
 

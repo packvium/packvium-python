@@ -109,6 +109,7 @@ class Packer:
             portfolio = orchestrator.solve(fixed.free, request.containers, self.config, deadline,
                                            fixed.containers)
         raw_solutions = portfolio.solutions
+        request_order = {item.id: index for index, item in enumerate(items)}
         ranked = []
         validator = IndependentSolutionValidator()
         scorer = self.solution_scorer or resolve_objective_scorer(self.config.objective, self.config)
@@ -170,7 +171,7 @@ class Packer:
             ranked.append(PackingResult(
                 status,
                 raw.containers,
-                raw.unpacked,
+                in_request_order(raw.unpacked, request_order),
                 AlgorithmReport(
                     self.config.profile.value,
                     raw.solver_name,
@@ -233,6 +234,14 @@ class Packer:
             best.objective,
             currency=request.currency,
         )
+
+
+def in_request_order(unpacked: tuple, request_order: dict[str, int]) -> tuple:
+    """`unpacked` in the order the request listed the items, each item's instances by number
+. Every engine reports this order, whichever search left the items out and in
+    whichever order it gave up on them. O(u log u) for u unpacked instances."""
+    return tuple(sorted(unpacked, key=lambda entry: (request_order[entry.instance.item.id],
+                                                     entry.instance.sequence)))
 
 
 def _stated_optimality(

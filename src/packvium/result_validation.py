@@ -1971,27 +1971,6 @@ def _swept_region(envelope: Box, container: tuple[int, int, int], direction: str
     return Box(x1, y1, z1, x2 - x1, y2 - y1, z2 - z1)
 
 
-def _has_clear_exit(
-    item_id: str,
-    envelopes: dict[str, tuple[Box, dict, ItemSpec | None]],
-    present: set[str],
-    container: tuple[int, int, int],
-    directions: Sequence[str] = _EXIT_DIRECTIONS,
-) -> bool:
-    """Can `item_id` be slid straight out through some container wall without
-    passing through any other currently-present placement?"""
-    envelope = envelopes[item_id][0]
-    for direction in directions:
-        region = _swept_region(envelope, container, direction)
-        if not any(
-            other_id != item_id and region.intersects(envelopes[other_id][0])
-            for other_id in present
-        ):
-            return True
-    return False
-
-
-
 def corridor_replay_succeeds(
     boxes: dict[str, Box],
     stops: dict[str, float],
@@ -2061,14 +2040,14 @@ def _check_route_removal_order(
     if not stops:
         return
     present = set(envelopes)
+    directions = doors or _EXIT_DIRECTIONS
     for stop in sorted(set(stops.values())):
         due = {item_id for item_id, value in stops.items() if value == stop and item_id in present}
+        exits = _ExitBlockers(due, envelopes, present, container, directions)
         while due:
             removable = [
                 item_id for item_id in due
-                if not (direct_above[item_id] & present)
-                and _has_clear_exit(item_id, envelopes, present, container,
-                                    doors or _EXIT_DIRECTIONS)
+                if not (direct_above[item_id] & present) and exits.has_clear_exit(item_id)
             ]
             if not removable:
                 issues.append(Issue(
@@ -2080,6 +2059,41 @@ def _check_route_removal_order(
             chosen = min(removable)
             present.discard(chosen)
             due.discard(chosen)
+            exits.remove(chosen, due, envelopes)
+
+
+class _ExitBlockers:
+    """How many present items stand in each exit of every item due at the current stop
+    (A-08), as Rust's `ExitBlockers`. Taking an item out lowers the counts it was
+    part of instead of re-testing every due item against every present one; an exit that
+    is clear stays clear, so each verdict is the one a fresh sweep of every present item would give.
+    `O(|due| * n * d)` once per stop, then `O(|due| * d)` per removal: `O(n^2 * d)` over a
+    route, where re-testing cost `O(n^3 * d)`."""
+
+    def __init__(self, due: set[str], envelopes: dict[str, tuple[Box, dict, ItemSpec | None]],
+                 present: set[str], container: tuple[int, int, int], directions: Sequence[str]):
+        self._exits: dict[str, list[list]] = {}
+        for item_id in due:
+            envelope = envelopes[item_id][0]
+            item_exits = []
+            for direction in directions:
+                region = _swept_region(envelope, container, direction)
+                blockers = sum(1 for other_id in present
+                               if other_id != item_id and region.intersects(envelopes[other_id][0]))
+                item_exits.append([region, blockers])
+            self._exits[item_id] = item_exits
+
+    def has_clear_exit(self, item_id: str) -> bool:
+        return any(blockers == 0 for _, blockers in self._exits[item_id])
+
+    def remove(self, removed: str, due: set[str],
+               envelopes: dict[str, tuple[Box, dict, ItemSpec | None]]) -> None:
+        """`removed` leaves the container: every exit of `due` it stood in is one blocker lighter."""
+        envelope = envelopes[removed][0]
+        for item_id in due:
+            for exit_ in self._exits[item_id]:
+                if exit_[0].intersects(envelope):
+                    exit_[1] -= 1
 
 
 def validate(request: dict, result: dict) -> list[Issue]:

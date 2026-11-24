@@ -35,7 +35,7 @@ for a hand-built scene) -- not re-verified here.
 from __future__ import annotations
 
 from ._compat import dataclass
-from typing import Sequence
+from typing import Iterable, Sequence
 
 from .constraints import (SQUARE_METRE_TICKS, LoadSupportGraph, LoadUnit, _touches_corners,
                           direct_support_view, load_units, non_stackable_failure, overloaded,
@@ -214,24 +214,94 @@ def safe_removal_order(boxes: Sequence[AxisAlignedBox], container: Dimensions,
     `InvalidDirectionError` if `directions` names anything outside the six-value
     vocabulary."""
     _validated(directions)
-    graph = UnloadingDependencyGraph.build(boxes)
-    present = frozenset(range(len(boxes)))
+    search = _RemovalSearch(boxes, container, directions)
     order: list[int] = []
-    while present:
-        chosen = None
-        for index in range(len(boxes)):
-            if (index in present and not (graph.depends_on[index] & present)
-                    and _clear_direction(index, boxes[index], boxes, present, container, directions) is not None):
-                chosen = index
-                break
-        if chosen is None:
-            raise SequenceError(present)
+    while search.present:
         # Deterministic: the lowest index among this step's candidates, not
         # arbitrary set iteration order.
+        chosen = search.next_removable(range(len(boxes)))
+        if chosen is None:
+            raise SequenceError(frozenset(search.present))
         order.append(chosen)
-        present = present - {chosen}
+        search.remove(chosen)
     replay_removal_order(boxes, container, order, directions)
     return order
+
+
+#: What the removal search knows about one box's way out, as Rust's `Exits`: never tested,
+#: found blocked once, or counted (each direction's sweep with its present blockers). A box
+#: found removable is removed at once, so no state records that.
+_UNTESTED, _BLOCKED = "untested", "blocked"
+
+
+class _RemovalSearch:
+    """The lowest-index-first removal search (A-08), as Rust's `RemovalSearch`.
+
+    It answers exactly what a rescan from index 0 after every removal would. A box found
+    blocked by the early-exit scan is only marked; blocked a second time it gets per-direction
+    blocker counts that each removal lowers, so it is never tested against the whole scene
+    again. A scene whose first box is usually removable never pays for counts at all.
+
+    Worst case `O(n^2 * d)`: each box is scanned once with early exit, counted once in
+    `O(n * d)`, then costs `O(d)` per removal -- where rescanning cost `O(n^3 * d)`.
+    """
+
+    def __init__(self, boxes: Sequence[AxisAlignedBox], container: Dimensions,
+                 directions: Sequence[str]):
+        self._boxes = boxes
+        self._container = container
+        self._directions = directions
+        self.present: set[int] = set(range(len(boxes)))
+        graph = UnloadingDependencyGraph.build(boxes)
+        #: Present boxes still resting on each box, and the boxes each one rests on.
+        self._resting_on_top = [len(riders) for riders in graph.depends_on]
+        self._supporters: list[list[int]] = [[] for _ in boxes]
+        for lower, riders in enumerate(graph.depends_on):
+            for rider in riders:
+                self._supporters[rider].append(lower)
+        self._exits: list = [_UNTESTED] * len(boxes)
+
+    def next_removable(self, candidates: Iterable[int]) -> int | None:
+        """The first of `candidates`, in their order, that is present and removable now."""
+        for index in candidates:
+            if index in self.present and self._removable(index):
+                return index
+        return None
+
+    def remove(self, removed: int) -> None:
+        self.present.discard(removed)
+        box = self._boxes[removed]
+        for exits in self._exits:
+            if isinstance(exits, list):
+                for exit_ in exits:
+                    if sweep_intersects(exit_[0], box):
+                        exit_[1] -= 1
+        for lower in self._supporters[removed]:
+            self._resting_on_top[lower] -= 1
+        self._supporters[removed] = []
+
+    def _removable(self, index: int) -> bool:
+        if self._resting_on_top[index]:
+            return False
+        exits = self._exits[index]
+        if exits == _UNTESTED:
+            self._exits[index] = _BLOCKED
+            return _clear_direction(index, self._boxes[index], self._boxes, self.present,
+                                    self._container, self._directions) is not None
+        if exits == _BLOCKED:
+            exits = self._count_blockers(index)
+        self._exits[index] = exits
+        return any(blockers == 0 for _, blockers in exits)
+
+    def _count_blockers(self, index: int) -> list[list]:
+        box = self._boxes[index]
+        counted = []
+        for direction in self._directions:
+            sweep = swept_volume(box, self._container, direction)
+            blockers = sum(1 for other in self.present
+                           if other != index and sweep_intersects(sweep, self._boxes[other]))
+            counted.append([sweep, blockers])
+        return counted
 
 
 def safe_route_removal_order(boxes: Sequence[AxisAlignedBox], stops: Sequence[int | None],
@@ -256,25 +326,19 @@ def safe_route_removal_order(boxes: Sequence[AxisAlignedBox], stops: Sequence[in
     `directions` names anything outside the six-value vocabulary.
     """
     _validated(directions)
-    graph = UnloadingDependencyGraph.build(boxes)
-    remaining = frozenset(range(len(boxes)))
+    search = _RemovalSearch(boxes, container, directions)
     order: list[int] = []
     for stop in sorted({stop for stop in stops if stop is not None}):
-        due = frozenset(index for index in remaining if stops[index] == stop)
+        due = [index for index in range(len(boxes)) if stops[index] == stop and index in search.present]
         while due:
-            chosen = None
-            for index in range(len(boxes)):
-                if (index in due and not (graph.depends_on[index] & remaining)
-                        and _clear_direction(index, boxes[index], boxes, remaining, container, directions) is not None):
-                    chosen = index
-                    break
-            if chosen is None:
-                raise RouteSequenceError(stop, due)
             # Deterministic: the lowest index among this step's candidates, not
             # arbitrary set iteration order.
+            chosen = search.next_removable(due)
+            if chosen is None:
+                raise RouteSequenceError(stop, frozenset(due))
             order.append(chosen)
-            remaining = remaining - {chosen}
-            due = due - {chosen}
+            search.remove(chosen)
+            due.remove(chosen)
     return order
 
 
